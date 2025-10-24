@@ -1,0 +1,83 @@
+{
+    "editor.formatOnSave": true,
+    //"editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "[json]": {
+        "editor.formatOnSave": true
+    },
+    "clangd.arguments": [
+        "--header-insertion=never"
+    ],
+    "output.smartScroll.enabled": false,
+    "workbench.tree.indent": 16,
+    "C_Cpp.autoAddFileAssociations": false,
+    "C_Cpp.dimInactiveRegions": true,
+    "C_Cpp.errorSquiggles": "enabled",
+    "C_Cpp.intelliSenseCacheSize": 0,
+    "C_Cpp.intelliSenseMemoryLimit": 256,
+    "C_Cpp.maxSymbolSearchResults": 500,
+    "C_Cpp.intelliSenseEngine": "default",
+    "cmake.options.statusBarVisibility": "visible",
+    // 8GB per job seems reasonable
+    "cmake.parallelJobs": 4,
+    "cSpell.enabled": true,
+    "doxdocgen.generic.useGitUserName": true,
+    "doxdocgen.generic.useGitUserEmail": true,
+    "doxdocgen.generic.order": [
+        "brief",
+        "empty",
+        "param",
+        "tparam",
+        "return"
+    ],
+    "doxdocgen.generic.briefTemplate": "\\brief ",
+    "doxdocgen.cpp.ctorText": "",
+    "doxdocgen.cpp.dtorText": "",
+    "doxdocgen.c.factoryMethodText": "",
+    "doxdocgen.c.getterText": "",
+    "doxdocgen.c.setterText": "",
+    "doxdocgen.generic.paramTemplate": "\\param {param} ",
+    "doxdocgen.cpp.tparamTemplate": "\\tparam {param} ",
+    "doxdocgen.generic.returnTemplate": "\\return ",
+    "restoreTerminals.terminals": [
+        {
+            "splitTerminals": [
+                {
+                    "name": "bin 0",
+                    "commands": [
+                        "cd bin/"
+                    ],
+                    "shouldRunCommands": true
+                }
+            ]
+        },
+        {
+            "splitTerminals": [
+                {
+                    "name": "bin 1",
+                    "commands": [
+                        "cd bin/"
+                    ],
+                    "shouldRunCommands": true
+                }
+            ]
+        },
+        {
+            "splitTerminals": [
+                {
+                    "name": "scripts 0",
+                    "commands": [
+                        "cd scripts"
+                    ],
+                    "shouldRunCommands": true
+                },
+                {
+                    "name": "scripts 1",
+                    "commands": [
+                        "cd scripts"
+                    ],
+                    "shouldRunCommands": true
+                }
+            ]
+        }
+    ]
+}

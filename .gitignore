@@ -41,7 +41,7 @@ Thumbs.db
 # IDE files
 .vs/
 .idea/
-.vscode/
+#.vscode/
 .cache
 language.settings.xml
 **/**.swp

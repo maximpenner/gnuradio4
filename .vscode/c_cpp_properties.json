@@ -1,0 +1,25 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/blocks/basic/include",
+                "${workspaceFolder}/blocks/electric/include",
+                "${workspaceFolder}/blocks/fileio/include",
+                "${workspaceFolder}/blocks/filter/include",
+                "${workspaceFolder}/blocks/fourier/include",
+                "${workspaceFolder}/blocks/htpp/include",
+                "${workspaceFolder}/blocks/libs/include",
+                "${workspaceFolder}/blocks/math/include",
+                "${workspaceFolder}/blocks/soapy/include",
+                "${workspaceFolder}/core/include",
+                "${workspaceFolder}/meta/include"
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/g++",
+            "cppStandard": "c++23",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
