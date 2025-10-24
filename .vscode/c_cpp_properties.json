@@ -3,20 +3,24 @@
         {
             "name": "Linux",
             "includePath": [
+                "${workspaceFolder}/build/_deps/pmt-src/include",
+                "${workspaceFolder}/build/_deps/vir-simd-src/",
+                "${workspaceFolder}/bench",
                 "${workspaceFolder}/blocks/basic/include",
-                "${workspaceFolder}/blocks/electric/include",
+                "${workspaceFolder}/blocks/electrical/include",
                 "${workspaceFolder}/blocks/fileio/include",
                 "${workspaceFolder}/blocks/filter/include",
                 "${workspaceFolder}/blocks/fourier/include",
-                "${workspaceFolder}/blocks/htpp/include",
-                "${workspaceFolder}/blocks/libs/include",
+                "${workspaceFolder}/blocks/http/include",
                 "${workspaceFolder}/blocks/math/include",
                 "${workspaceFolder}/blocks/soapy/include",
                 "${workspaceFolder}/core/include",
-                "${workspaceFolder}/meta/include"
+                "${workspaceFolder}/meta/include",
+                "${workspaceFolder}/third_party/exprtk",
+                "${workspaceFolder}/third_party/magic_enum"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/g++",
+            "compilerPath": "/usr/bin/clang++-18",
             "cppStandard": "c++23",
             "intelliSenseMode": "linux-gcc-x64"
         }

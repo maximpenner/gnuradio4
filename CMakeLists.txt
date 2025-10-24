@@ -507,6 +507,7 @@ add_subdirectory(core)
 add_subdirectory(meta)
 add_subdirectory(algorithm)
 add_subdirectory(blocks)
+add_subdirectory(experimental)
 
 if(ENABLE_TESTING
    AND (UNIX
