@@ -1,4 +1,10 @@
-add_library(gnuradio-core STATIC src/PmtTypeHelpers.cpp src/Graph.cpp src/PluginLoader.cpp)
+add_library(
+  gnuradio-core STATIC
+  src/Value.cpp
+  src/ValueHelper.cpp
+  src/Graph.cpp
+  src/PluginLoader.cpp
+  src/PmtTypeHelpers.cpp)
 
 set(public_headers
     include/gnuradio-4.0/annotated.hpp
@@ -10,6 +16,7 @@ set(public_headers
     include/gnuradio-4.0/BufferSkeleton.hpp
     include/gnuradio-4.0/CircularBuffer.hpp
     include/gnuradio-4.0/ClaimStrategy.hpp
+    include/gnuradio-4.0/BlockingSync.hpp
     include/gnuradio-4.0/DataSet.hpp
     include/gnuradio-4.0/Graph_yaml_importer.hpp
     include/gnuradio-4.0/Graph.hpp
@@ -18,6 +25,7 @@ set(public_headers
     include/gnuradio-4.0/MemoryAllocators.hpp
     include/gnuradio-4.0/Message.hpp
     include/gnuradio-4.0/PluginLoader.hpp
+    include/gnuradio-4.0/PmtCollections.hpp
     include/gnuradio-4.0/Port.hpp
     include/gnuradio-4.0/PortTraits.hpp
     include/gnuradio-4.0/Profiler.hpp
@@ -26,7 +34,13 @@ set(public_headers
     include/gnuradio-4.0/Sequence.hpp
     include/gnuradio-4.0/Settings.hpp
     include/gnuradio-4.0/Tag.hpp
+    include/gnuradio-4.0/Tensor.hpp
+    include/gnuradio-4.0/TensorMath.hpp
     include/gnuradio-4.0/TriggerMatcher.hpp
+    include/gnuradio-4.0/Value.hpp
+    include/gnuradio-4.0/ValueHelper.hpp
+    include/gnuradio-4.0/formatter/ValueFormatter.hpp
+    include/gnuradio-4.0/formatter/ValueHelperFormatter.hpp
     include/gnuradio-4.0/WaitStrategy.hpp
     include/gnuradio-4.0/YamlPmt.hpp)
 
@@ -43,7 +57,6 @@ target_link_libraries(
   PUBLIC gnuradio-options
          gnuradio-meta
          magic_enum
-         pmtv
          vir)
 
 add_library(gnuradio-blocklib-core SHARED src/BlockRegistry.cpp)

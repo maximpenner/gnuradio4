@@ -4,7 +4,6 @@
 #include <execution>
 #include <functional>
 #include <numeric>
-#include <vector>
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
@@ -28,9 +27,9 @@ struct fir_filter : Block<fir_filter<T>> {
 The transfer function of an FIR filter is given by:
 H(z) = b[0] + b[1]*z^-1 + b[2]*z^-2 + ... + b[N]*z^-N
 )"">;
-    PortIn<T>      in;
-    PortOut<T>     out;
-    std::vector<T> b{T{1}}; // feedforward coefficients
+    PortIn<T>  in;
+    PortOut<T> out;
+    Tensor<T>  b{T{1}}; // feedforward coefficients
 
     GR_MAKE_REFLECTABLE(fir_filter, in, out, b);
 
@@ -69,10 +68,10 @@ struct iir_filter : Block<iir_filter<T, form>> {
 b are the feed-forward coefficients (N.B. b[0] denoting the newest and b[-1] the previous sample)
 a are the feedback coefficients
 )"">;
-    PortIn<T>      in;
-    PortOut<T>     out;
-    std::vector<T> b{1}; // feed-forward coefficients
-    std::vector<T> a{1}; // feedback coefficients
+    PortIn<T>  in;
+    PortOut<T> out;
+    Tensor<T>  b{1}; // feed-forward coefficients
+    Tensor<T>  a{1}; // feedback coefficients
 
     GR_MAKE_REFLECTABLE(iir_filter, in, out, b, a);
 
@@ -149,9 +148,9 @@ with selectable filter type (low-pass, high-pass, band-pass, band-stop), and sup
     Annotated<FilterType, "filter_type", Doc<"Filter type ('FIR' or 'IIR')">, Visible>                                                         filter_type     = FilterType::IIR;
     Annotated<filter::Type, "filter_response", Doc<"Filter response ('LOWPASS', 'HIGHPASS', 'BANDPASS', 'BANDSTOP')">, Visible>                filter_response = filter::Type::LOWPASS;
     Annotated<gr::Size_t, "filter_order", Doc<"Filter order">>                                                                                 filter_order{3};
-    Annotated<double, "f_low", Doc<"Low cutoff frequency in Hz">, Visible>                                                                     f_low{0.1};
-    Annotated<double, "f_high", Doc<"High cutoff frequency in Hz (only for BANDPASS/BANDSTOP)">, Visible>                                      f_high{0.2};
-    Annotated<double, "sample rate", Doc<"Sample rate in Hz">, Visible>                                                                        sample_rate{1.0};
+    Annotated<float, "f_low", Doc<"Low cutoff frequency in Hz">, Visible>                                                                      f_low{0.1f};
+    Annotated<float, "f_high", Doc<"High cutoff frequency in Hz (only for BANDPASS/BANDSTOP)">, Visible>                                       f_high{0.2f};
+    Annotated<float, "sample rate", Doc<"Sample rate in Hz">, Visible>                                                                         sample_rate{1.0f};
     Annotated<gr::Size_t, "decimation factor", Doc<"1: none, i.e. preserving the relationship: N_out = N_in/decimate">>                        decimate{1U};
     Annotated<filter::iir::Design, "iir_design_method", Doc<"IIR Filter design method ('BUTTERWORTH', 'BESSEL', 'CHEBYSHEV1', 'CHEBYSHEV2')">> iir_design_method = filter::iir::Design::BUTTERWORTH;
     Annotated<algorithm::window::Type, "fir_design_method", Doc<"FIR Filter design method ('None', 'Rectangular', 'Hamming', 'Hann', 'HannExp', 'Blackman', 'Nuttall', 'BlackmanHarris', 'BlackmanNuttall', 'FlatTop', 'Exponential', 'Kaiser')">> //
@@ -171,9 +170,9 @@ with selectable filter type (low-pass, high-pass, band-pass, band-stop), and sup
         // Set up filter parameters
         FilterParameters params;
         params.order = filter_order;
-        params.fLow  = f_low;
-        params.fHigh = f_high;
-        params.fs    = sample_rate;
+        params.fLow  = static_cast<double>(f_low);
+        params.fHigh = static_cast<double>(f_high);
+        params.fs    = static_cast<double>(sample_rate);
 
         if (filter_type == FilterType::FIR) { // design FIR filter
             _filter = FilterImpl(fir::designFilter<ValueType>(filter_response, params, fir_design_method));

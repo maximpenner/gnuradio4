@@ -72,7 +72,7 @@ const boost::ut::suite TagTests = [] {
         auto& uiSink = testGraph.emplaceBlock<testing::ImChartMonitor<float>>({{"name", "BasicImChartSink"}});
         expect(uiSink.meta_information.value.contains("Drawable")) << "drawable";
 
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"in">(funcGen)));
+        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"clk_in">(funcGen)));
         expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(sink)));
         expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(uiSink)));
 
@@ -108,9 +108,9 @@ const boost::ut::suite TagTests = [] {
         auto& funcGen = testGraph.emplaceBlock<FunctionGenerator<float>>({{"sample_rate", sample_rate}, {"name", "FunctionGenerator"}});
         initFunctionGenerator(funcGen);
 
-        auto& uiSink = testGraph.emplaceBlock<testing::ImChartMonitor<float, false>>({{"reset_view", true}, {"plot_graph", true}, {"plot_timing", true}, {"timeout_ms", 400ULL}});
+        auto& uiSink = testGraph.emplaceBlock<testing::ImChartMonitor<float, false>>({{"reset_view", true}, {"plot_graph", true}, {"plot_timing", true}, {"timeout_ms", static_cast<gr::Size_t>(400)}});
 
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"in">(funcGen)));
+        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"clk_in">(funcGen)));
         expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(uiSink)));
 
         scheduler::Simple sched;

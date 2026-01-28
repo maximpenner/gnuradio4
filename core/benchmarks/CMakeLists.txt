@@ -7,7 +7,6 @@ if(NOT EMSCRIPTEN)
               gnuradio-core
               gnuradio-blocklib-core
               gnuradio-plugin
-              fftw
               gr-basic
               gr-fileio
               gr-math
@@ -21,12 +20,15 @@ if(NOT EMSCRIPTEN)
     else()
       target_compile_options(${BM_NAME} PRIVATE -O3 -march=native)
     endif()
+
+    target_include_directories(${BM_NAME} PRIVATE "../test")
   endfunction()
 
   add_gr_benchmark(bm_Buffer)
   add_gr_benchmark(bm_HistoryBuffer)
   add_gr_benchmark(bm_Profiler)
   add_gr_benchmark(bm_Scheduler)
+  add_gr_benchmark(bm_tensor)
   add_gr_benchmark(bm-nosonar_node_api)
   add_gr_benchmark(bm_sync)
   add_gr_benchmark(bm_portLimits)

@@ -1,6 +1,7 @@
 #ifndef GNURADIO_ATOMICBITSET_HPP
 #define GNURADIO_ATOMICBITSET_HPP
 
+#include <atomic>
 #include <vector>
 
 #ifndef forceinline

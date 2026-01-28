@@ -233,9 +233,13 @@ const boost::ut::suite TopologyGraphTests = [] {
         TestScheduler scheduler(std::move(testGraph));
 
         "Add an edge"_test = [&] {
-            property_map data = {{"sourceBlock", std::string(blockOut->uniqueName())}, {"sourcePort", "out"}, //
-                {"destinationBlock", std::string(blockIn->uniqueName())}, {"destinationPort", "in"},          //
-                {"minBufferSize", gr::Size_t()}, {"weight", 0}, {"edgeName", "unnamed edge"}};
+            property_map data = {{std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK), std::string(blockOut->uniqueName())}, //
+                {std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT), "out"},                                                 //
+                {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK), std::string(blockIn->uniqueName())},              //
+                {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT), "in"},                                             //
+                {std::pmr::string(gr::serialization_fields::EDGE_MIN_BUFFER_SIZE), gr::Size_t()},                                      //
+                {std::pmr::string(gr::serialization_fields::EDGE_WEIGHT), 0},                                                          //
+                {std::pmr::string(gr::serialization_fields::EDGE_NAME), "unnamed edge"}};
 
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, scheduler.unique_name(), scheduler::property::kEmplaceEdge, data, //
                 ReplyChecker{.expectedEndpoint = scheduler::property::kEdgeEmplaced});
@@ -243,22 +247,28 @@ const boost::ut::suite TopologyGraphTests = [] {
 
         "Fail to add an edge because source port is invalid"_test = [&] {
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, scheduler.unique_name(), scheduler::property::kEmplaceEdge, //
-                {{"sourceBlock", std::string(blockOut->uniqueName())}, {"sourcePort", "OUTPUT"},                                                          //
-                    {"destinationBlock", std::string(blockIn->uniqueName())}, {"destinationPort", "in"}},
+                {{std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK), std::string(blockOut->uniqueName())},                                    //
+                    {std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT), "OUTPUT"},                                                             //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK), std::string(blockIn->uniqueName())},                             //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT), "in"}},
                 ReplyChecker{.expectedEndpoint = scheduler::property::kEmplaceEdge, .expectedHasData = false});
         };
 
         "Fail to add an edge because destination port is invalid"_test = [&] {
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, scheduler.unique_name(), scheduler::property::kEmplaceEdge, //
-                {{"sourceBlock", std::string(blockOut->uniqueName())}, {"sourcePort", "in"},                                                              //
-                    {"destinationBlock", std::string(blockIn->uniqueName())}, {"destinationPort", "INPUT"}},
+                {{std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK), std::string(blockOut->uniqueName())},                                    //
+                    {std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT), "in"},                                                                 //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK), std::string(blockIn->uniqueName())},                             //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT), "INPUT"}},
                 ReplyChecker{.expectedEndpoint = scheduler::property::kEmplaceEdge, .expectedHasData = false});
         };
 
         "Fail to add an edge because ports are not compatible"_test = [&] {
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, scheduler.unique_name(), scheduler::property::kEmplaceEdge, //
-                {{"sourceBlock", std::string(blockOut->uniqueName())}, {"sourcePort", "out"},                                                             //
-                    {"destinationBlock", std::string(blockWrongType->uniqueName())}, {"destinationPort", "in"}},
+                {{std::pmr::string(gr::serialization_fields::EDGE_SOURCE_BLOCK), std::string(blockOut->uniqueName())},                                    //
+                    {std::pmr::string(gr::serialization_fields::EDGE_SOURCE_PORT), "out"},                                                                //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_BLOCK), std::string(blockWrongType->uniqueName())},                      //
+                    {std::pmr::string(gr::serialization_fields::EDGE_DESTINATION_PORT), "in"}},
                 ReplyChecker{.expectedEndpoint = scheduler::property::kEmplaceEdge, .expectedHasData = false});
         };
     };
@@ -314,7 +324,7 @@ const boost::ut::suite TopologyGraphTests = [] {
             expect(!atLeastOneReplyFromScheduler) << "should not receive a reply";
             property_map stagedSettings = scheduler.scheduler().settings().stagedParameters();
             expect(stagedSettings.contains("timeout_ms"));
-            expect(eq(42UZ, std::get<gr::Size_t>(stagedSettings.at("timeout_ms"))));
+            expect(eq(42UZ, gr::test::get_value_or_fail<gr::Size_t>(stagedSettings.at("timeout_ms"))));
 
             // setting staged setting via staged setting (N.B. non-real-time <-> real-time setting decoupling
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, "", block::property::kSetting, {{"timeout_ms", 43}}, //
@@ -322,25 +332,25 @@ const boost::ut::suite TopologyGraphTests = [] {
 
             stagedSettings = scheduler.scheduler().settings().stagedParameters();
             expect(stagedSettings.contains("timeout_ms"));
-            expect(eq(43UZ, std::get<gr::Size_t>(stagedSettings.at("timeout_ms"))));
+            expect(eq(43UZ, gr::test::get_value_or_fail<gr::Size_t>(stagedSettings.at("timeout_ms"))));
 
             testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, "", block::property::kSetting, {{"timeout_ms", 43}}, //
                 ReplyChecker{.expectedEndpoint = block::property::kSetting, .expectedHasData = false});
         };
     };
 
-    "std::vector<pmtv::pmt> segfault test"_test = [] {
-        // Regression test kept because a now-fixed bug in pmtv::pmt’s trivial relocation caused a segfault
-        // with Clang 18/19 when std::vector<pmtv::pmt> reallocated (first seen in “Get GRC Yaml tests”);
+    "std::vector<pmt::Value> segfault test"_test = [] {
+        // Regression test kept because a now-fixed bug in pmt::Value’s trivial relocation caused a segfault
+        // with Clang 18/19 when std::vector<pmt::Value> reallocated (first seen in “Get GRC Yaml tests”);
         // this ensures it doesn’t regress.
 
-        std::vector<pmtv::pmt> vec;
+        std::vector<pmt::Value> vec;
         for (int i = 0; i < 2000; ++i) {
-            vec.push_back(property_map{{std::string("key"), std::string("value")}});
+            vec.push_back(property_map{{"key", std::string("value")}});
         }
-        std::println("std::vector<pmtv::pmt> segfault test before");
+        std::println("std::vector<pmt::Value> segfault test before");
         [[maybe_unused]] auto p0 = vec[0]; // Segfault happens here
-        std::println("std::vector<pmtv::pmt> segfault test after");
+        std::println("std::vector<pmt::Value> segfault test after");
     };
 
     "Get GRC Yaml tests"_test = [] {
@@ -355,7 +365,7 @@ const boost::ut::suite TopologyGraphTests = [] {
                 if (reply.endpoint == scheduler::property::kGraphGRC && reply.data.has_value()) {
                     const auto& data = reply.data.value();
                     expect(data.contains("value")) << "Reply should contain 'value' field";
-                    const auto& yaml = std::get<std::string>(data.at("value"));
+                    const auto& yaml = gr::test::get_value_or_fail<std::string>(data.at("value"));
                     expect(!yaml.empty()) << "YAML string should not be empty";
                     std::println("YAML content:\n{}", yaml);
 
@@ -389,14 +399,16 @@ const boost::ut::suite TopologyGraphTests = [] {
         );
 
         auto uiConstraintsFor = [](const auto& block) {
-            return std::visit(meta::overloaded{
+            property_map result{};
+            pmt::ValueVisitor(meta::overloaded{
                                   //
-                                  []<typename... Args>(const std::map<Args...>& map) { return gr::property_map(map); },
+                                  [&result]<typename... Args>(const gr::property_map& map) { result = gr::property_map(map); },
                                   //
-                                  [](const auto& /*v*/) { return gr::property_map{}; }
+                                  [&result]<typename Other>(const Other& /*v*/) { result = gr::property_map{}; }
                                   //
-                              },
-                block->settings().get("ui_constraints").value());
+                              })
+                .visit(block->settings().get("ui_constraints").value());
+            return result;
         };
 
         awaitCondition(200ms, [&] {
@@ -405,8 +417,8 @@ const boost::ut::suite TopologyGraphTests = [] {
                    !uiConstraintsFor(copy1).empty();
         });
 
-        expect(eq(42.f, std::get<float>(uiConstraintsFor(copy1)["x"])));
-        expect(eq(43.f, std::get<float>(uiConstraintsFor(copy2)["x"])));
+        expect(eq(42.f, gr::test::get_value_or_fail<float>(uiConstraintsFor(copy1)["x"])));
+        expect(eq(43.f, gr::test::get_value_or_fail<float>(uiConstraintsFor(copy2)["x"])));
 
         // Check if block introspection includes ui_constraints
 
@@ -428,9 +440,9 @@ const boost::ut::suite TopologyGraphTests = [] {
                 std::set<float> seenUiConstraintsY;
 
                 for (const auto& child : children) {
-                    const auto& uiConstraints = gr::detail::getOrThrow(gr::detail::getProperty<gr::property_map>(std::get<gr::property_map>(child.second), "parameters"s, "ui_constraints"s));
-                    seenUiConstraintsX.insert(std::get<float>(uiConstraints.at("x"s)));
-                    seenUiConstraintsY.insert(std::get<float>(uiConstraints.at("y"s)));
+                    const auto& uiConstraints = gr::detail::getOrThrow(gr::detail::getProperty<gr::property_map>(gr::test::get_value_or_fail<gr::property_map>(child.second), "parameters"s, "ui_constraints"s));
+                    seenUiConstraintsX.insert(gr::test::get_value_or_fail<float>(uiConstraints.at("x")));
+                    seenUiConstraintsY.insert(gr::test::get_value_or_fail<float>(uiConstraints.at("y")));
                 }
 
                 expect(seenUiConstraintsX == std::set<float>{42, 43});
@@ -442,8 +454,8 @@ const boost::ut::suite TopologyGraphTests = [] {
             auto copy1direct = static_cast<gr::testing::Copy<float>*>(copy1->raw());
             auto copy2direct = static_cast<gr::testing::Copy<float>*>(copy2->raw());
 
-            expect(eq(42.f, std::get<float>(copy1direct->ui_constraints["x"])));
-            expect(eq(43.f, std::get<float>(copy2direct->ui_constraints["x"])));
+            expect(eq(42.f, gr::test::get_value_or_fail<float>(copy1direct->ui_constraints["x"])));
+            expect(eq(43.f, gr::test::get_value_or_fail<float>(copy2direct->ui_constraints["x"])));
         }
 
         scheduler.scheduler().requestStop();
@@ -451,8 +463,8 @@ const boost::ut::suite TopologyGraphTests = [] {
         auto copy1direct = static_cast<gr::testing::Copy<float>*>(copy1->raw());
         auto copy2direct = static_cast<gr::testing::Copy<float>*>(copy2->raw());
 
-        expect(eq(42.f, std::get<float>(copy1direct->ui_constraints["x"])));
-        expect(eq(43.f, std::get<float>(copy2direct->ui_constraints["x"])));
+        expect(eq(42.f, gr::test::get_value_or_fail<float>(copy1direct->ui_constraints["x"])));
+        expect(eq(43.f, gr::test::get_value_or_fail<float>(copy2direct->ui_constraints["x"])));
     };
 };
 
@@ -494,18 +506,42 @@ const boost::ut::suite MoreTopologyGraphTests = [] {
     expect(eq(getNReplyMessages(scheduler.fromScheduler), 0UZ));
 
     // Get the whole graph
+    std::string graphUniqueName;
     testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, "", graph::property::kGraphInspect, property_map{}, //
-        [](const Message& reply) {
+        [&graphUniqueName](const Message& reply) {
             if (reply.endpoint != graph::property::kGraphInspected) {
                 return false;
             }
 
-            const auto& data     = reply.data.value();
-            const auto& children = std::get<property_map>(data.at("children"s));
+            const auto& data = reply.data.value();
+
+            graphUniqueName = gr::test::get_value_or_fail<std::string>(data.at(std::pmr::string(serialization_fields::BLOCK_UNIQUE_NAME)));
+
+            const auto& children = gr::test::get_value_or_fail<property_map>(data.at("children"));
             expect(eq(children.size(), 4UZ));
 
-            const auto& edges = std::get<property_map>(data.at("edges"s));
+            const auto& edges = gr::test::get_value_or_fail<property_map>(data.at("edges"));
             expect(eq(edges.size(), 4UZ));
+            return true;
+        });
+
+    // Inspect the scheduler
+    testing::sendAndWaitForReply<Set>(scheduler.toScheduler, scheduler.fromScheduler, "", scheduler::property::kSchedulerInspect, property_map{}, //
+        [&graphUniqueName](const Message& reply) {
+            if (reply.endpoint != scheduler::property::kSchedulerInspected) {
+                return false;
+            }
+
+            const auto& data     = reply.data.value();
+            const auto& children = gr::test::get_value_or_fail<property_map>(data.at("children"));
+            expect(eq(children.size(), 1UZ));
+
+            for (const auto& [childUniqueName, child] : children) {
+                expect(eq(std::string_view(graphUniqueName), std::string_view(childUniqueName)));
+            }
+
+            // Scheduler contains a graph as the only child, no edges in scheduler
+            expect(!data.contains("edges"s));
             return true;
         });
 

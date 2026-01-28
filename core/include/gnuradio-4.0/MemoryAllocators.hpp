@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <new>
 #include <print>
 #include <source_location>
@@ -16,6 +17,15 @@
 #include <gnuradio-4.0/meta/formatter.hpp>
 
 namespace gr::allocator {
+template<std::size_t Align, typename T>
+[[nodiscard]] constexpr bool isAligned(const T* p) noexcept {
+    return std::bit_cast<std::uintptr_t>(std::to_address(p)) % Align == 0UZ;
+}
+
+template<typename T>
+[[nodiscard]] constexpr bool isAligned(const T* p, std::size_t alignment) noexcept {
+    return std::bit_cast<std::uintptr_t>(std::to_address(p)) % alignment == 0UZ;
+}
 
 /** @brief STL allocator guaranteeing `alignment` byte alignment. */
 template<typename T, std::size_t alignment = 64UZ>
@@ -72,6 +82,49 @@ concept has_allocate_at_least = requires(Alloc a, std::size_t n) {
     { std::allocator_traits<Alloc>::allocate_at_least(a, n) };
 };
 
+template<typename Alloc>
+struct is_aligned_allocator : std::false_type {};
+
+template<typename T, std::size_t Alignment>
+struct is_aligned_allocator<gr::allocator::Aligned<T, Alignment>> : std::true_type {};
+
+template<typename Alloc>
+inline constexpr bool is_aligned_allocator_v = is_aligned_allocator<Alloc>::value;
+
+template<typename Container>
+struct container_allocator {
+    using type = std::allocator<typename Container::value_type>;
+};
+
+template<typename T, typename Alloc>
+struct container_allocator<std::vector<T, Alloc>> {
+    using type = Alloc;
+};
+
+template<typename Container>
+using container_allocator_t = typename container_allocator<Container>::type;
+
+template<typename Alloc, typename NewType>
+struct rebind_allocator {
+    using type = typename std::allocator_traits<Alloc>::template rebind_alloc<NewType>;
+};
+
+template<typename T, std::size_t Alignment, typename NewType>
+struct rebind_allocator<gr::allocator::Aligned<T, Alignment>, NewType> {
+    using type = gr::allocator::Aligned<NewType, Alignment>;
+};
+
+template<typename Alloc, typename NewType>
+using rebind_allocator_t = typename rebind_allocator<Alloc, NewType>::type;
+
+template<typename InputContainer, typename OutputType>
+struct deduce_output_allocator {
+    using input_alloc = container_allocator_t<std::remove_cvref_t<InputContainer>>;
+    using type        = rebind_allocator_t<input_alloc, OutputType>;
+};
+
+template<typename InputContainer, typename OutputType>
+using deduce_output_allocator_t = typename deduce_output_allocator<InputContainer, OutputType>::type;
 } // namespace detail
 
 template<typename T, typename Underlying = Default<T>, typename Logger = detail::DefaultLogger>
@@ -137,6 +190,54 @@ struct Logging {
     }
 };
 
+namespace pmr {
+
+template<class T>
+[[nodiscard]] T* migrate(std::pmr::memory_resource& target_resource, std::pmr::memory_resource& source_resource, T* source_ptr, std::size_t count) {
+    if (source_ptr == nullptr || count == 0) {
+        return nullptr;
+    }
+
+    if (&target_resource == &source_resource) {
+        return source_ptr;
+    }
+
+    T*          target_ptr  = static_cast<T*>(target_resource.allocate(count * sizeof(T), alignof(T)));
+    std::size_t constructed = 0;
+
+    try {
+        // move or copy elements
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            std::memcpy(target_ptr, source_ptr, count * sizeof(T));
+            constructed = count;
+        } else if constexpr (std::is_nothrow_move_constructible_v<T>) {
+            std::uninitialized_move_n(source_ptr, count, target_ptr);
+            constructed = count;
+        } else { // copy with exception safety for throwing move constructors
+            for (; constructed < count; ++constructed) {
+                std::construct_at(target_ptr + constructed, source_ptr[constructed]);
+            }
+        }
+    } catch (...) { // clean up partially constructed target
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            std::destroy_n(target_ptr, constructed);
+        }
+        target_resource.deallocate(target_ptr, count * sizeof(T), alignof(T));
+        throw; // Source remains intact (strong guarantee)
+    }
+
+    // Destroy source objects
+    if constexpr (!std::is_trivially_destructible_v<T>) {
+        std::destroy_n(source_ptr, count);
+    }
+
+    // Deallocate source memory
+    source_resource.deallocate(source_ptr, count * sizeof(T), alignof(T));
+
+    return target_ptr;
+}
+
+} // namespace pmr
 } // namespace gr::allocator
 
 #endif // MEMORYALLOCATORS_HPP

@@ -150,17 +150,17 @@ const boost::ut::suite ManagedSubGraph = [] {
         std::expected<void, Error> schedulerRet;
 
         testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.wrapper->uniqueName(), graph::property::kSubgraphExportPort, //
-            property_map{{"uniqueBlockName"s, std::string(demo.pass2->unique_name)}, {"portDirection"s, "output"}, {"portName"s, "out"}, {"exportFlag"s, true}}, [](const Message& reply) { return reply.endpoint == graph::property::kSubgraphExportedPort; });
+            property_map{{"uniqueBlockName", std::string(demo.pass2->unique_name)}, {"portDirection", "output"}, {"portName", "out"}, {"exportedName", "outExp"}, {"exportFlag", true}}, [](const Message& reply) { return reply.endpoint == graph::property::kSubgraphExportedPort; });
 
         testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.wrapper->uniqueName(), graph::property::kSubgraphExportPort, //
-            property_map{{"uniqueBlockName"s, std::string(demo.pass1->unique_name)}, {"portDirection"s, "input"}, {"portName"s, "in"}, {"exportFlag"s, true}}, [](const Message& reply) { return reply.endpoint == graph::property::kSubgraphExportedPort; });
+            property_map{{"uniqueBlockName", std::string(demo.pass1->unique_name)}, {"portDirection", "input"}, {"portName", "in"}, {"exportedName", "inExp"}, {"exportFlag", true}}, [](const Message& reply) { return reply.endpoint == graph::property::kSubgraphExportedPort; });
 
         expect(eq(demo.wrapper->dynamicInputPortsSize(), 1UZ));
         expect(eq(demo.wrapper->dynamicOutputPortsSize(), 1UZ));
 
         // Make connections
-        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, source.unique_name, "out", std::string(demo.wrapper->uniqueName()), "in", scheduler.unique_name);
-        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, std::string(demo.wrapper->uniqueName()), "out", sink.unique_name, "in", scheduler.unique_name);
+        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, source.unique_name, "out", std::string(demo.wrapper->uniqueName()), "inExp", scheduler.unique_name);
+        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, std::string(demo.wrapper->uniqueName()), "outExp", sink.unique_name, "in", scheduler.unique_name);
         expect(eq(getNReplyMessages(fromScheduler), 0UZ));
 
         // Get the whole graph
@@ -168,21 +168,21 @@ const boost::ut::suite ManagedSubGraph = [] {
             auto msg = testing::sendAndWaitForReply<Get>(toScheduler, fromScheduler, scheduler.graph().unique_name /* serviceName */, graph::property::kGraphInspect /* endpoint */, property_map{} /* data */, [](const Message& reply) { return reply.endpoint == graph::property::kGraphInspected; });
             expect(msg.has_value()) << "msg should have a value";
             const auto& data     = msg.value().data.value();
-            const auto& children = std::get<property_map>(data.at("children"s));
+            const auto& children = gr::test::get_value_or_fail<property_map>(data.at("children"));
             expect(eq(children.size(), 3UZ));
 
-            const auto& edges = std::get<property_map>(data.at("edges"s));
+            const auto& edges = gr::test::get_value_or_fail<property_map>(data.at("edges"));
             expect(eq(edges.size(), 2UZ));
 
             std::size_t subGraphInConnections  = 0UZ;
             std::size_t subGraphOutConnections = 0UZ;
 
             for (const auto& [index, edge_] : edges) {
-                const auto& edge = std::get<property_map>(edge_);
-                if (std::get<std::string>(edge.at("destination_block")) == demo.wrapper->uniqueName()) {
+                const auto& edge = gr::test::get_value_or_fail<property_map>(edge_);
+                if (gr::test::get_value_or_fail<std::string>(edge.at("destination_block")) == demo.wrapper->uniqueName()) {
                     subGraphInConnections++;
                 }
-                if (std::get<std::string>(edge.at("source_block")) == demo.wrapper->uniqueName()) {
+                if (gr::test::get_value_or_fail<std::string>(edge.at("source_block")) == demo.wrapper->uniqueName()) {
                     subGraphOutConnections++;
                 }
             }
@@ -192,9 +192,9 @@ const boost::ut::suite ManagedSubGraph = [] {
             expect(eq(subGraphOutConnections, 1UZ));
 
             // Check subgraph topology
-            const auto& subGraphData     = std::get<property_map>(children.at(std::string(demo.wrapper->uniqueName())));
-            const auto& subGraphChildren = std::get<property_map>(subGraphData.at("children"s));
-            const auto& subGraphEdges    = std::get<property_map>(subGraphData.at("edges"s));
+            const auto& subGraphData     = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.wrapper->uniqueName())));
+            const auto& subGraphChildren = gr::test::get_value_or_fail<property_map>(subGraphData.at("children"));
+            const auto& subGraphEdges    = gr::test::get_value_or_fail<property_map>(subGraphData.at("edges"));
             expect(eq(subGraphChildren.size(), 2UZ));
             expect(eq(subGraphEdges.size(), 1UZ));
         }
@@ -266,11 +266,11 @@ const boost::ut::suite ExportPortsTests_ = [] {
         expect(awaitCondition(1s, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler thread up and running w/ timeout";
         expect(scheduler.state() == lifecycle::State::RUNNING) << "scheduler thread up and running";
 
-        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.schedulerUniqueName, graph::property::kSubgraphExportPort,                 //
-            property_map{{"uniqueBlockName"s, demo.pass2->unique_name}, {"portDirection"s, "output"s}, {"portName"s, "out"s}, {"exportFlag"s, true}}, //
+        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.schedulerUniqueName, graph::property::kSubgraphExportPort,                                               //
+            property_map{{"uniqueBlockName", demo.pass2->unique_name.value()}, {"portDirection", "output"}, {"portName", "out"}, {"exportedName", "outExp"}, {"exportFlag", true}}, //
             ReplyChecker{.expectedEndpoint = graph::property::kSubgraphExportedPort});
-        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.schedulerUniqueName, graph::property::kSubgraphExportPort,               //
-            property_map{{"uniqueBlockName"s, demo.pass1->unique_name}, {"portDirection"s, "input"s}, {"portName"s, "in"s}, {"exportFlag"s, true}}, //
+        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.schedulerUniqueName, graph::property::kSubgraphExportPort,                                            //
+            property_map{{"uniqueBlockName", demo.pass1->unique_name.value()}, {"portDirection", "input"}, {"portName", "in"}, {"exportedName", "inExp"}, {"exportFlag", true}}, //
             ReplyChecker{.expectedEndpoint = graph::property::kSubgraphExportedPort});
 
         for (const auto& block : graph.blocks()) {
@@ -279,8 +279,8 @@ const boost::ut::suite ExportPortsTests_ = [] {
         expect(eq(graph.blocks().size(), 3UZ)) << "should contain source->(copy->copy)->sink";
 
         // Make connections
-        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, source.unique_name, "out", demo.schedulerUniqueName, "in", scheduler.unique_name);
-        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, demo.schedulerUniqueName, "out", sink.unique_name, "in", scheduler.unique_name);
+        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, source.unique_name, "out", demo.schedulerUniqueName, "inExp", scheduler.unique_name);
+        sendAndWaitMessageEmplaceEdge(toScheduler, fromScheduler, demo.schedulerUniqueName, "outExp", sink.unique_name, "in", scheduler.unique_name);
 
         expect(eq(getNReplyMessages(fromScheduler), 0UZ));
 
@@ -293,10 +293,10 @@ const boost::ut::suite ExportPortsTests_ = [] {
                     }
 
                     const auto& data     = reply.data.value();
-                    const auto& children = std::get<property_map>(data.at("children"s));
+                    const auto& children = gr::test::get_value_or_fail<property_map>(data.at("children"));
                     expect(eq(children.size(), 3UZ));
 
-                    const auto& edges = std::get<property_map>(data.at("edges"s));
+                    const auto& edges = gr::test::get_value_or_fail<property_map>(data.at("edges"));
                     expect(eq(edges.size(), 2UZ));
 
                     std::size_t subGraphInConnections  = 0UZ;
@@ -305,11 +305,11 @@ const boost::ut::suite ExportPortsTests_ = [] {
                     // Check that the subgraph is connected properly
 
                     for (const auto& [index, edge_] : edges) {
-                        const auto& edge = std::get<property_map>(edge_);
-                        if (std::get<std::string>(edge.at("destination_block")) == demo.schedulerUniqueName) {
+                        const auto& edge = gr::test::get_value_or_fail<property_map>(edge_);
+                        if (gr::test::get_value_or_fail<std::string>(edge.at("destination_block")) == demo.schedulerUniqueName) {
                             subGraphInConnections++;
                         }
-                        if (std::get<std::string>(edge.at("source_block")) == demo.schedulerUniqueName) {
+                        if (gr::test::get_value_or_fail<std::string>(edge.at("source_block")) == demo.schedulerUniqueName) {
                             subGraphOutConnections++;
                         }
                     }
@@ -317,9 +317,9 @@ const boost::ut::suite ExportPortsTests_ = [] {
                     expect(eq(subGraphOutConnections, 1UZ));
 
                     // Check subgraph topology
-                    const auto& subGraphData     = std::get<property_map>(children.at(demo.schedulerUniqueName));
-                    const auto& subGraphChildren = std::get<property_map>(subGraphData.at("children"s));
-                    const auto& subGraphEdges    = std::get<property_map>(subGraphData.at("edges"s));
+                    const auto& subGraphData     = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.schedulerUniqueName)));
+                    const auto& subGraphChildren = gr::test::get_value_or_fail<property_map>(subGraphData.at("children"));
+                    const auto& subGraphEdges    = gr::test::get_value_or_fail<property_map>(subGraphData.at("edges"));
                     expect(eq(subGraphChildren.size(), 2UZ));
                     expect(eq(subGraphEdges.size(), 1UZ));
                     return true;
