@@ -15,6 +15,7 @@
                 "${workspaceFolder}/blocks/math/include",
                 "${workspaceFolder}/blocks/soapy/include",
                 "${workspaceFolder}/core/include",
+                "${workspaceFolder}/experimental",
                 "${workspaceFolder}/meta/include",
                 "${workspaceFolder}/third_party/exprtk",
                 "${workspaceFolder}/third_party/magic_enum"
