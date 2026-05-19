@@ -11,10 +11,11 @@ namespace gr::blocks::basic {
 GR_REGISTER_BLOCK("gr::blocks::basic::SchmittTriggerNoInterpolation", gr::blocks::basic::SchmittTrigger, ([T], gr::trigger::InterpolationMethod::NO_INTERPOLATION), [ std::int16_t, std::int32_t, float, double ])
 GR_REGISTER_BLOCK("gr::blocks::basic::SchmittTriggerBasic", gr::blocks::basic::SchmittTrigger, ([T], gr::trigger::InterpolationMethod::BASIC_LINEAR_INTERPOLATION), [ std::int16_t, std::int32_t, float, double ])
 GR_REGISTER_BLOCK("gr::blocks::basic::SchmittTrigger", gr::blocks::basic::SchmittTrigger, ([T], gr::trigger::InterpolationMethod::LINEAR_INTERPOLATION), [ std::int16_t, std::int32_t, float, double ])
+GR_REGISTER_BLOCK("gr::blocks::basic::SchmittTriggerPolynomial", gr::blocks::basic::SchmittTrigger, ([T], gr::trigger::InterpolationMethod::POLYNOMIAL_INTERPOLATION), [ std::int16_t, std::int32_t, float, double ])
 
 template<typename T, gr::trigger::InterpolationMethod Method>
 requires(std::is_arithmetic_v<T> or (UncertainValueLike<T> && std::is_arithmetic_v<meta::fundamental_base_value_type_t<T>>))
-struct SchmittTrigger : public gr::Block<SchmittTrigger<T, Method>, NoDefaultTagForwarding> {
+struct SchmittTrigger : public gr::Block<SchmittTrigger<T, Method>, NoTagPropagation> {
     using Description = Doc<R""(@brief Digital Schmitt trigger implementation with optional intersample interpolation
 
 @see https://en.wikipedia.org/wiki/Schmitt_trigger
@@ -26,7 +27,6 @@ The following sub-sample interpolation methods are supported:
     the lower and upper threshold has been crossed and vice versa
   * POLYNOMIAL_INTERPOLATION: Savitzky–Golay filter-based methods
     https://en.wikipedia.org/wiki/Savitzky%E2%80%93Golay_filter
-    (TODO: WIP needs Tensor<T> and SVD implementation)
 
 The block generates the following optional trigger that are controlled by:
  * trigger_name_rising_edge  -> trigger name that is used when a rising edge is detected

@@ -8,7 +8,7 @@ namespace gr::testing {
 
 namespace utils {
 
-std::string format_variant(const auto& value) noexcept {
+inline std::string format_variant(const auto& value) noexcept {
     std::string result;
     pmt::ValueVisitor([&result](auto& arg) {
         using Type = std::decay_t<decltype(arg)>;
@@ -27,7 +27,7 @@ std::string format_variant(const auto& value) noexcept {
     return result;
 }
 
-void printChanges(const property_map& oldMap, const property_map& newMap) noexcept {
+inline void printChanges(const property_map& oldMap, const property_map& newMap) noexcept {
     for (const auto& [key, newValue] : newMap) {
         if (!oldMap.contains(key)) {
             std::print("    key added '{}` = {}\n", std::string_view(key), format_variant(newValue));
@@ -47,7 +47,6 @@ GR_REGISTER_BLOCK(gr::testing::SettingsChangeRecorder, [T], [ int32_t, float, do
 enum class TestEnum { TEST_STATE1, TEST_STATE2, TEST_STATE3 };
 
 template<typename T>
-// struct SettingsChangeRecorder : public Block<SettingsChangeRecorder<T>, BlockingIO<true>, SupportedTypes<float, double>> { // TODO: reenable BlockingIO
 struct SettingsChangeRecorder : Block<SettingsChangeRecorder<T>> {
     using Description = Doc<R""(some test doc documentation)"">;
     PortIn<T>  in{};
@@ -59,11 +58,13 @@ struct SettingsChangeRecorder : Block<SettingsChangeRecorder<T>> {
     gr::Size_t                                                                               n_samples_max = 0;
     Annotated<float, "sample rate", Limits<int64_t(0), std::numeric_limits<int64_t>::max()>> sample_rate   = 1.0f;
     Tensor<T>                                                                                vector_setting{gr::data_from, {T(3), T(2), T(1)}};
-    Annotated<Tensor<pmt::Value>, "string vector">                                           string_vector_setting       = {};
+    Annotated<std::vector<std::string>, "string vector">                                     string_vector_setting{};
+    std::array<T, 3UZ>                                                                       array_setting{T(3), T(2), T(1)};
+    std::array<std::string, 3UZ>                                                             string_array_setting{"", "", ""};
     TestEnum                                                                                 test_enum_setting           = TestEnum::TEST_STATE1;
     Annotated<TestEnum, "annotated enum">                                                    annotated_test_enum_setting = TestEnum::TEST_STATE1;
 
-    GR_MAKE_REFLECTABLE(SettingsChangeRecorder, in, out, scaling_factor, context, n_samples_max, sample_rate, vector_setting, string_vector_setting, test_enum_setting, annotated_test_enum_setting);
+    GR_MAKE_REFLECTABLE(SettingsChangeRecorder, in, out, scaling_factor, context, n_samples_max, sample_rate, vector_setting, string_vector_setting, array_setting, string_array_setting, test_enum_setting, annotated_test_enum_setting);
 
     bool       _debug            = true;
     int        _updateCount      = 0;

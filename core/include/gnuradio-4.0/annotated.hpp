@@ -2,6 +2,7 @@
 #define GNURADIO_ANNOTATED_HPP
 
 #include <format>
+#include <memory_resource>
 #include <sstream>
 #include <string_view>
 #include <type_traits>
@@ -63,14 +64,6 @@ static_assert(!Documentation<EmptyUnit>);
 struct Visible {};
 
 /**
- * @brief Annotates block, indicating to calling schedulers that it may block due IO.
- */
-template<bool UseIoThread = true> // TODO: replace bool by an enum or tag type: 'BlockingIO<false>' is very misleading
-struct BlockingIO {
-    [[maybe_unused]] constexpr static bool useIoThread = UseIoThread;
-};
-
-/**
  * @brief Disable default tag forwarding.
  *
  * There are two types of tag forwarding: (1) default All-To-All, and (2) user-implemented.
@@ -81,20 +74,30 @@ struct BlockingIO {
  * value will be kept.
  *
  * This default behavior is generally sufficient. However, if it’s not suitable for your use case, you can disable it
- * by adding the `NoDefaultTagForwarding` attribute to the template parameters. In such cases, the block should implement
- * custom tag forwarding in the `processBulk` function. The `InputSpanLike` and `OutputSpanLike` APIs are available to simplify
- * with custom tag forwarding.
+ * by adding `NoTagPropagation` to the template parameters and implementing custom forwarding via `forwardTags()`.
  */
-struct NoDefaultTagForwarding {};
+struct NoTagPropagation {};
 
 /**
- * @brief Specifies the Tag Forwarding Policy for blocks with chunked data constraints, namely `input_chunk_size != 1`.
- *
- * If this attribute is omitted, the default `Forward` policy applies. The available policies are:
- * - Forward (default, no attribute required): Processes the tag as if it belongs to the first sample of the **next** `processBulk(..)` call.
- * - Backward (`BackwardTagForwarding` is set): Processes the tag as if it belongs to the first sample of the **current** `processBulk(..)` call.
+ * @brief For fixed-chunk blocks: tags NOT at position 0 are delayed to the next chunk’s start.
+ * Tags at position 0 are forwarded immediately. Chunk size is NOT broken by tag positions.
+ * Use for blocks like FFT where the chunk size must remain fixed.
  */
-struct BackwardTagForwarding {};
+struct ForwardTagPropagation {};
+
+/**
+ * @brief For fixed-chunk blocks: ALL tags within the chunk are mapped to output position 0.
+ * All tags are consumed per chunk. Use for decimation blocks where multiple input samples
+ * map to one output sample.
+ */
+struct BackwardTagPropagation {};
+
+/**
+ * @brief Merges all forwarded input tags into a single output tag per chunk.
+ * This mimics the legacy forwarding behaviour. Tags at the same position are merged
+ * (last key wins). By default, tags are forwarded individually with cross-port dedup.
+ */
+struct MergeTagPropagation {};
 
 /**
  * @brief Annotates block, indicating to perform resampling based on the provided `inputChunkSize` and `outputChunkSize`.
@@ -186,7 +189,41 @@ using is_incompleteFinalUpdatePolicy = std::bool_constant<IsIncompleteFinalUpdat
 
 static_assert(is_incompleteFinalUpdatePolicy<IncompleteFinalUpdatePolicy<IncompleteFinalUpdateEnum::DROP>>::value);
 
-enum class UICategory { None, Toolbar, ChartPane, StatusBar, Menu };
+enum class UICategory {
+    None,        /// No UI contribution (default).
+    MenuBar,     /// Global app menu bar items (File/Edit/View…).
+    Toolbar,     /// Compact, frequently used actions/toggles.
+    StatusBar,   /// Always-visible, low-interaction status readouts.
+    Content,     /// Primary viewport output (plots/canvases/dashboards).
+    Panel,       /// Secondary panels (inspectors, settings, lists, logs).
+    Overlay,     /// Layered HUD over Content (cursors/markers/annotations).
+    ContextMenu, /// Right-click / long-press contextual popup menus.
+    Dialog,      /// Modal/semi-modal short workflows (export/config/confirm).
+    Notification /// Transient non-modal feedback (toast/banner).
+};
+
+} // namespace gr
+
+// Compile-time performance override; phased out with C++26 reflection.
+namespace gr::meta::detail {
+template<>
+struct EnumTraits<gr::UICategory> {
+    static constexpr std::array<std::pair<gr::UICategory, std::string_view>, 10> entries = {{
+        {gr::UICategory::None, "None"},
+        {gr::UICategory::MenuBar, "MenuBar"},
+        {gr::UICategory::Toolbar, "Toolbar"},
+        {gr::UICategory::StatusBar, "StatusBar"},
+        {gr::UICategory::Content, "Content"},
+        {gr::UICategory::Panel, "Panel"},
+        {gr::UICategory::Overlay, "Overlay"},
+        {gr::UICategory::ContextMenu, "ContextMenu"},
+        {gr::UICategory::Dialog, "Dialog"},
+        {gr::UICategory::Notification, "Notification"},
+    }};
+};
+} // namespace gr::meta::detail
+
+namespace gr {
 
 /**
  * @brief Annotates block, indicating that it is drawable and provides a  mandatory `void draw()` method.
@@ -211,7 +248,7 @@ using is_drawable = std::bool_constant<IsDrawable<T>>;
 
 using NotDrawable = Drawable<UICategory::None, "">; // nomen-est-omen
 static_assert(is_drawable<NotDrawable>::value);
-static_assert(is_drawable<Drawable<UICategory::ChartPane, "console">>::value);
+static_assert(is_drawable<Drawable<UICategory::Content, "console">>::value);
 static_assert(!is_drawable<int>::value);
 
 /**
@@ -331,6 +368,8 @@ struct Annotated {
     constexpr bool operator==(const U& other) const noexcept {
         if constexpr (requires { other.value; }) {
             return value == other.value;
+        } else if constexpr (std::is_convertible_v<const T&, std::string_view> && std::is_convertible_v<const U&, std::string_view>) {
+            return std::string_view(value) == std::string_view(other);
         } else {
             return value == other;
         }
@@ -353,9 +392,9 @@ struct Annotated {
     }
 
     operator std::string_view() const noexcept
-    requires std::is_same_v<T, std::string>
+    requires(std::is_same_v<T, std::string> || std::is_same_v<T, std::pmr::string>)
     {
-        return std::string_view(value); // Convert from std::string to std::string_view
+        return std::string_view(value);
     }
 
     // meta-information

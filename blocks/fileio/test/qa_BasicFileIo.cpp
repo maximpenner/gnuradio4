@@ -6,6 +6,7 @@
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
 #include <format>
+#include <optional>
 
 namespace {
 using namespace std::chrono_literals;
@@ -30,6 +31,18 @@ auto createWatchdog(Scheduler& sched, std::chrono::seconds timeOut = 2s, std::ch
     return std::make_pair(std::move(watchdogThread), externalInterventionNeeded);
 }
 
+template<typename Scheduler>
+std::expected<void, gr::Error> runSchedulerAndWait(Scheduler& sched) {
+#ifdef __EMSCRIPTEN__
+    std::optional<std::expected<void, gr::Error>> result;
+    std::thread                                   worker([&sched, &result]() { result = sched.runAndWait(); });
+    worker.join();
+    return std::move(*result);
+#else
+    return sched.runAndWait();
+#endif
+}
+
 template<typename DataType>
 void runTest(const gr::blocks::fileio::Mode mode) {
     using namespace boost::ut;
@@ -49,14 +62,14 @@ void runTest(const gr::blocks::fileio::Mode mode) {
 
         auto& source   = flow.emplaceBlock<ConstantSource<DataType>>({{"n_samples_max", nSamples}});
         auto& fileSink = flow.emplaceBlock<BasicFileSink<DataType>>({{"file_name", fileName}, {"mode", modeName}, {"max_bytes_per_file", maxFileSize}});
-        expect(eq(gr::ConnectionResult::SUCCESS, flow.template connect<"out">(source).template to<"in">(fileSink)));
+        expect(flow.connect<"out", "in">(source, fileSink).has_value());
 
         scheduler sched;
         if (auto ret = sched.exchange(std::move(flow)); !ret) {
             throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
         }
         auto [watchdogThread, externalInterventionNeeded] = createWatchdog(sched, 2s);
-        expect(sched.runAndWait().has_value()) << testCaseName;
+        expect(runSchedulerAndWait(sched).has_value()) << testCaseName;
 
         if (watchdogThread.joinable()) {
             watchdogThread.join();
@@ -90,14 +103,14 @@ void runTest(const gr::blocks::fileio::Mode mode) {
         auto&       fileSource = flow.emplaceBlock<BasicFileSource<DataType>>({{"file_name", fileName}, {"mode", modeName}});
         auto&       sink       = flow.emplaceBlock<CountingSink<DataType>>();
 
-        expect(eq(gr::ConnectionResult::SUCCESS, flow.template connect<"out">(fileSource).template to<"in">(sink)));
+        expect(flow.connect<"out", "in">(fileSource, sink).has_value());
 
         scheduler schedRead;
         if (auto ret = schedRead.exchange(std::move(flow)); !ret) {
             throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
         }
         auto [watchdogThreadRead, externalInterventionNeededRead] = createWatchdog(schedRead, 2s);
-        expect(schedRead.runAndWait().has_value()) << testCaseName;
+        expect(runSchedulerAndWait(schedRead).has_value()) << testCaseName;
 
         if (watchdogThreadRead.joinable()) {
             watchdogThreadRead.join();
@@ -116,14 +129,14 @@ void runTest(const gr::blocks::fileio::Mode mode) {
         auto&                fileSource = flow.emplaceBlock<BasicFileSource<DataType>>({{"file_name", fileName}, {"mode", modeName}, {"offset", offsetSamples}, {"length", lengthSamples}});
         auto&                sink       = flow.emplaceBlock<CountingSink<DataType>>();
 
-        expect(eq(gr::ConnectionResult::SUCCESS, flow.template connect<"out">(fileSource).template to<"in">(sink)));
+        expect(flow.connect<"out", "in">(fileSource, sink).has_value());
 
         scheduler schedRead;
         if (auto ret = schedRead.exchange(std::move(flow)); !ret) {
             throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
         }
         auto [watchdogThreadRead, externalInterventionNeededRead] = createWatchdog(schedRead, 2s);
-        expect(schedRead.runAndWait().has_value()) << testCaseName;
+        expect(runSchedulerAndWait(schedRead).has_value()) << testCaseName;
 
         if (watchdogThreadRead.joinable()) {
             watchdogThreadRead.join();

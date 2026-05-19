@@ -54,21 +54,21 @@ using namespace gr::message;
 
 namespace property {
 
-inline static const char* kEmplaceBlock = "EmplaceBlock";
-inline static const char* kRemoveBlock  = "RemoveBlock";
-inline static const char* kReplaceBlock = "ReplaceBlock";
-inline static const char* kEmplaceEdge  = "EmplaceEdge";
-inline static const char* kRemoveEdge   = "RemoveEdge";
+inline static const char* const kEmplaceBlock = "EmplaceBlock";
+inline static const char* const kRemoveBlock  = "RemoveBlock";
+inline static const char* const kReplaceBlock = "ReplaceBlock";
+inline static const char* const kEmplaceEdge  = "EmplaceEdge";
+inline static const char* const kRemoveEdge   = "RemoveEdge";
 
-inline static const char* kBlockEmplaced = "BlockEmplaced";
-inline static const char* kBlockRemoved  = "BlockRemoved";
-inline static const char* kBlockReplaced = "BlockReplaced";
-inline static const char* kEdgeEmplaced  = "EdgeEmplaced";
-inline static const char* kEdgeRemoved   = "EdgeRemoved";
+inline static const char* const kBlockEmplaced = "BlockEmplaced";
+inline static const char* const kBlockRemoved  = "BlockRemoved";
+inline static const char* const kBlockReplaced = "BlockReplaced";
+inline static const char* const kEdgeEmplaced  = "EdgeEmplaced";
+inline static const char* const kEdgeRemoved   = "EdgeRemoved";
 
-inline static const char* kGraphGRC           = "GraphGRC";
-inline static const char* kSchedulerInspect   = "SchedulerInspect";
-inline static const char* kSchedulerInspected = "SchedulerInspected";
+inline static const char* const kGraphGRC           = "GraphGRC";
+inline static const char* const kSchedulerInspect   = "SchedulerInspect";
+inline static const char* const kSchedulerInspected = "SchedulerInspected";
 } // namespace property
 
 enum class ExecutionPolicy {
@@ -125,8 +125,8 @@ private:
 protected:
     using ProfileHandle = decltype(std::declval<TProfiler&>().forThisThread());
 
-    std::atomic_bool              _valid{true};
-    std::atomic<std::size_t>      _nWatchdogsRunning{0};
+    bool                          _valid{true};
+    std::size_t                   _nWatchdogsRunning{0};
     meta::indirect<gr::Graph>     _graph{};
     TProfiler                     _profiler{};
     ProfileHandle                 _profilerHandler{_profiler.forThisThread()};
@@ -149,6 +149,8 @@ protected:
     bool                     _messagePortsConnected = false;
 
     std::atomic_flag _processingScheduledMessages;
+    bool             _workQuiescenceRequested{false};
+    std::size_t      _nWorkersInWork{0};
 
     void rebuildProfiler(const profiling::Options& opt) {
         std::destroy_at(std::addressof(_profiler));
@@ -158,15 +160,16 @@ protected:
 
     void registerPropertyCallbacks() noexcept {
         _forbid_reserved_overrides();
+        using PropertyCallback                            = BlockBase::PropertyCallback;
         auto& callbacks                                   = this->propertyCallbacks;
-        callbacks[scheduler::property::kEmplaceBlock]     = std::mem_fn(&SchedulerBase::propertyCallbackEmplaceBlock);
-        callbacks[scheduler::property::kRemoveBlock]      = std::mem_fn(&SchedulerBase::propertyCallbackRemoveBlock);
-        callbacks[scheduler::property::kRemoveEdge]       = std::mem_fn(&SchedulerBase::propertyCallbackRemoveEdge);
-        callbacks[scheduler::property::kEmplaceEdge]      = std::mem_fn(&SchedulerBase::propertyCallbackEmplaceEdge);
-        callbacks[scheduler::property::kReplaceBlock]     = std::mem_fn(&SchedulerBase::propertyCallbackReplaceBlock);
-        callbacks[scheduler::property::kGraphGRC]         = std::mem_fn(&SchedulerBase::propertyCallbackGraphGRC);
-        callbacks[scheduler::property::kSchedulerInspect] = std::mem_fn(&SchedulerBase::propertyCallbackSchedulerInspect);
-        callbacks[graph::property::kInspectBlock]         = std::mem_fn(&SchedulerBase::propertyCallbackInspectBlock);
+        callbacks[scheduler::property::kEmplaceBlock]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackEmplaceBlock);
+        callbacks[scheduler::property::kRemoveBlock]      = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackRemoveBlock);
+        callbacks[scheduler::property::kRemoveEdge]       = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackRemoveEdge);
+        callbacks[scheduler::property::kEmplaceEdge]      = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackEmplaceEdge);
+        callbacks[scheduler::property::kReplaceBlock]     = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackReplaceBlock);
+        callbacks[scheduler::property::kGraphGRC]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackGraphGRC);
+        callbacks[scheduler::property::kSchedulerInspect] = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackSchedulerInspect);
+        callbacks[graph::property::kInspectBlock]         = static_cast<PropertyCallback>(&SchedulerBase::propertyCallbackInspectBlock);
         this->settings().updateActiveParameters();
     }
 
@@ -181,11 +184,50 @@ public:
     Annotated<std::size_t, "max_work_items", Doc<"number of work items per work scheduling interval (controls latency)">>      max_work_items                  = std::numeric_limits<std::size_t>::max(); // TODO: check whether we can keep this std::size_t or more consistently to gr::Size_t
     Annotated<property_map, "sched_settings", Doc<"scheduler implementation specific settings">>                               sched_settings{};
 
-    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, sched_settings);
+    GR_MAKE_REFLECTABLE(SchedulerBase, timeout_ms, watchdog_timeout, timeout_inactivity_count, process_stream_to_message_ratio, max_work_items, poolName, sched_settings);
 
     constexpr static block::Category blockCategory = block::Category::ScheduledBlockGroup;
 
     [[nodiscard]] static constexpr auto executionPolicy() { return execution; }
+
+    void requestWorkQuiescence() {
+        gr::atomic_ref(_workQuiescenceRequested).store_release(true);
+        while (gr::atomic_ref(_nWorkersInWork).load_acquire() > 0) {
+            std::this_thread::yield();
+        }
+    }
+
+    void releaseWorkQuiescence() { gr::atomic_ref(_workQuiescenceRequested).store_release(false); }
+
+    void requestWorkQuiescenceAll() {
+        requestWorkQuiescence();
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
+            if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
+                if (auto* sm = dynamic_cast<SchedulerModel*>(block.get())) {
+                    sm->requestWorkQuiescence();
+                }
+            }
+        });
+    }
+
+    void releaseWorkQuiescenceAll() {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
+            if (block->blockCategory() == block::Category::ScheduledBlockGroup) {
+                if (auto* sm = dynamic_cast<SchedulerModel*>(block.get())) {
+                    sm->releaseWorkQuiescence();
+                }
+            }
+        });
+        releaseWorkQuiescence();
+    }
+
+    struct WorkQuiescenceGuard {
+        SchedulerBase* _scheduler;
+        explicit WorkQuiescenceGuard(SchedulerBase* s) : _scheduler(s) { _scheduler->requestWorkQuiescenceAll(); }
+        ~WorkQuiescenceGuard() { _scheduler->releaseWorkQuiescenceAll(); }
+        WorkQuiescenceGuard(const WorkQuiescenceGuard&)            = delete;
+        WorkQuiescenceGuard& operator=(const WorkQuiescenceGuard&) = delete;
+    };
 
     SchedulerBase() : base_t(gr::property_map()) { registerPropertyCallbacks(); }
 
@@ -212,17 +254,17 @@ public:
         }
         waitDone();
 
-        _valid.store(false, std::memory_order_release); // Mark as invalid
+        gr::atomic_ref(_valid).store_release(false); // Mark as invalid
 
         // the watchdog dereferences SchedulerBase, wait until it finishes
-        while (_nWatchdogsRunning.load() != 0) {
+        while (gr::atomic_ref(_nWatchdogsRunning).load_acquire() != 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         _executionOrder.reset(); // force earlier crashes if this is accessed after destruction (e.g. from thread that was kept running)
     }
 
-    [[nodiscard]] std::expected<meta::indirect<Graph>, Error> exchange(meta::indirect<Graph>&& newGraph, std::string_view defaultPoolName = gr::thread_pool::kDefaultCpuPoolId, const profiling::Options& option = {}) {
+    [[nodiscard]] std::expected<meta::indirect<Graph>, Error> exchange(meta::indirect<Graph>&& newGraph, const profiling::Options& option = {}) {
         using enum lifecycle::State;
         const auto oldState = this->state();
         if (lifecycle::isActive(oldState)) { // need to stop running scheduler
@@ -246,8 +288,13 @@ public:
             rebuildProfiler(option);
         }
 
-        if (_pool->name() != defaultPoolName) { // need to update thread pool
-            _pool = gr::thread_pool::Manager::instance().get(defaultPoolName);
+        if (_pool->name() != std::string_view(poolName.value)) { // sync pool with (possibly updated) poolName setting
+            const std::string_view requested{poolName.value};
+            try {
+                _pool = gr::thread_pool::Manager::instance().get(requested);
+            } catch (const std::exception& e) {
+                this->emitErrorMessage("exchange(poolName)", std::format("unknown thread pool '{}': {}; keeping existing pool '{}'", requested, e.what(), _pool->name()));
+            }
         }
 
         // restore the original lifecycle state
@@ -286,7 +333,22 @@ public:
         return _nRunningJobs->value() > 0UZ;
     }
 
-    void stateChanged(lifecycle::State newState) { this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(magic_enum::enum_name(newState))}}); }
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) noexcept {
+        if (!newSettings.contains("poolName")) {
+            return;
+        }
+        const std::string_view requested{poolName.value};
+        if (!_pool || _pool->name() == requested) {
+            return;
+        }
+        try {
+            _pool = gr::thread_pool::Manager::instance().get(requested);
+        } catch (const std::exception& e) {
+            this->emitErrorMessage("settingsChanged(poolName)", std::format("unknown thread pool '{}': {}; keeping existing pool '{}'", requested, e.what(), _pool->name()));
+        }
+    }
+
+    void stateChanged(lifecycle::State newState) { this->notifyListeners(block::property::kLifeCycleState, {{"state", std::string(gr::meta::enumName(newState).value_or(""))}}); }
 
     [[nodiscard]] std::span<std::shared_ptr<BlockModel>>       blocks() noexcept { return _graph->blocks(); }
     [[nodiscard]] std::span<const std::shared_ptr<BlockModel>> blocks() const noexcept { return _graph->blocks(); }
@@ -301,11 +363,13 @@ public:
         }
 
         auto toSchedulerBuffer = _fromChildMessagePort.buffer();
-        std::ignore            = _toChildMessagePort.connect(_graph->msgIn);
+        if (!_toChildMessagePort.connect(_graph->msgIn)) {
+            this->emitErrorMessage("connectBlockMessagePorts()", "Failed to connect scheduler input message port to graph msgIn");
+        }
         _graph->msgOut.setBuffer(toSchedulerBuffer.streamBuffer, toSchedulerBuffer.tagBuffer);
 
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this, &toSchedulerBuffer](auto& block) {
-            if (ConnectionResult::SUCCESS != _toChildMessagePort.connect(*block->msgIn)) {
+            if (!_toChildMessagePort.connect(*block->msgIn)) {
                 this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", block->uniqueName()));
             }
 
@@ -315,7 +379,7 @@ public:
         // Forward any messages to children that were received before the scheduler was initialised
         _messagePortsConnected = true;
 
-        WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().reserve<SpanReleasePolicy::ProcessAll>(_pendingMessagesToChildren.size());
+        WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(_pendingMessagesToChildren.size());
         std::ranges::move(_pendingMessagesToChildren, msgSpan.begin());
         _pendingMessagesToChildren.clear();
     }
@@ -327,7 +391,7 @@ public:
             if (msg.serviceName != this->unique_name && msg.serviceName != this->name && msg.endpoint != block::property::kLifeCycleState) {
                 // only forward wildcard, non-scheduler messages, and non-lifecycle messages (N.B. the latter is exclusively handled by the scheduler)
                 if (_messagePortsConnected) {
-                    WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().reserve<SpanReleasePolicy::ProcessAll>(1UZ);
+                    WriterSpanLike auto msgSpan = _toChildMessagePort.streamWriter().template reserve<SpanReleasePolicy::ProcessAll>(1UZ);
                     msgSpan[0]                  = msg;
                 } else {
                     // if not yet connected, keep messages to children in cache and forward when connecting
@@ -431,7 +495,7 @@ public:
 protected:
     void disconnectAllEdges() {
         _graph->disconnectAllEdges();
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&](auto& block) {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [](auto& block) {
             if (block->blockCategory() == TransparentBlockGroup) {
                 auto* graph = static_cast<GraphWrapper<gr::Graph>*>(block.get());
                 graph->blockRef().disconnectAllEdges();
@@ -455,7 +519,7 @@ protected:
 
         bool result = _graph->connectPendingEdges();
         primeFeedbackPorts(gr::graph::flatten(*_graph)); // need to flatten graph due to potential loops from within the subgraph to blocks in the parents.
-        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&](auto& block) {
+        graph::forEachBlock<TransparentBlockGroup>(*_graph, [&result, &primeFeedbackPorts](auto& block) {
             if (block->blockCategory() == TransparentBlockGroup) {
                 auto* graph = static_cast<GraphWrapper<gr::Graph>*>(block.get());
                 result      = result && graph->blockRef().connectPendingEdges();
@@ -538,7 +602,7 @@ protected:
         auto ioThreadPool = gr::thread_pool::Manager::defaultIoPool();
 
         // keep outside of the lambda, as ~SchedulerBase() might finish before watchdog even starts
-        _nWatchdogsRunning.fetch_add(1, std::memory_order_acq_rel);
+        gr::atomic_ref(_nWatchdogsRunning).fetch_add(1UZ);
 
         ioThreadPool->execute([this] { this->runWatchDog(watchdog_timeout.value, timeout_inactivity_count.value); });
 
@@ -561,7 +625,7 @@ protected:
         }
     }
 
-    void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) noexcept {
+    void poolWorker(const std::size_t runnerID, std::shared_ptr<std::vector<std::vector<std::shared_ptr<BlockModel>>>> jobList) {
         using enum lifecycle::State;
         std::shared_ptr<gr::Sequence> progress     = _graph->_progress; // life-time guaranteed
         std::shared_ptr<gr::Sequence> nRunningJobs = _nRunningJobs;
@@ -592,7 +656,12 @@ protected:
                 currentProgress = progress->value();
             }
 
-            bool hasMessagesToProcess = msgToCount == 0UZ;
+            // Process messages either when the ratio gate opens, or immediately when any entry-point port has
+            // pending traffic. This keeps the ratio's amortisation of empty-queue checks while giving arriving
+            // messages single-iteration latency (important for multi-hop sub-scheduler message paths).
+            const bool hasMessagesToProcess = msgToCount == 0UZ                //
+                                              || this->msgIn.available() > 0UZ //
+                                              || _fromChildMessagePort.available() > 0UZ;
             if (hasMessagesToProcess) {
                 if (runnerID == 0UZ || nRunningJobs->value() == 0UZ) {
                     this->processScheduledMessages(); // execute the scheduler- and Graph-specific message handler only once globally
@@ -616,12 +685,22 @@ protected:
             }
 
             if (activeState == RUNNING) {
-                gr::work::Result result = traverseBlockListOnce(localBlockList);
-                if (result.status == work::Status::DONE) {
-                    break; // nothing happened -> shutdown this worker
-                } else if (result.status == work::Status::ERROR) {
-                    this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(ERROR));
-                    break;
+                if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
+                    std::this_thread::yield();
+                } else {
+                    gr::atomic_ref(_nWorkersInWork).fetch_add(1UZ);
+                    if (gr::atomic_ref(_workQuiescenceRequested).load_acquire()) {
+                        gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
+                    } else {
+                        gr::work::Result result = traverseBlockListOnce(localBlockList);
+                        gr::atomic_ref(_nWorkersInWork).fetch_sub(1UZ);
+                        if (result.status == work::Status::DONE) {
+                            break; // nothing happened -> shutdown this worker
+                        } else if (result.status == work::Status::ERROR) {
+                            this->emitErrorMessageIfAny("LifecycleState (ERROR)", this->changeStateTo(ERROR));
+                            break;
+                        }
+                    }
                 }
             } else if (activeState == PAUSED) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(timeout_ms));
@@ -654,18 +733,18 @@ protected:
     }
 
     void runWatchDog(std::size_t timeOut_ms, std::size_t timeOut_count) {
-        on_scope_exit _ = [this] { _nWatchdogsRunning.fetch_sub(1, std::memory_order_acq_rel); };
+        on_scope_exit _ = [this] { gr::atomic_ref(_nWatchdogsRunning).fetch_sub(1UZ); };
 
         auto thisName = gr::meta::shorten_type_name(this->unique_name);
         gr::thread_pool::thread::setThreadName(std::format("WatchDog-{}", thisName));
 
         const auto deadline      = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         const auto checkInterval = std::chrono::milliseconds(std::max(timeout_ms / 10UZ, 1UZ));
-        while (_valid.load(std::memory_order_acquire) && _nRunningJobs->value() == 0UZ && std::chrono::steady_clock::now() < deadline && lifecycle::isActive(this->state())) {
+        while (gr::atomic_ref(_valid).load_acquire() && _nRunningJobs->value() == 0UZ && std::chrono::steady_clock::now() < deadline && lifecycle::isActive(this->state())) {
             std::this_thread::sleep_for(checkInterval);
         }
 
-        if (!_valid.load(std::memory_order_acquire) || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
+        if (!gr::atomic_ref(_valid).load_acquire() || _nRunningJobs->value() == 0UZ || !lifecycle::isActive(this->state())) {
             return; // abort watchdog: scheduler inactive or jobs already finished.
         }
 
@@ -731,13 +810,49 @@ protected:
 
     void resume() {
         using enum lifecycle::State;
-        auto result = connectPendingEdges();
-        if (!result) {
-            this->emitErrorMessage("init()", "Failed to connect blocks in graph");
+        {
+            WorkQuiescenceGuard quiescence(this);
+            auto                result = connectPendingEdges();
+            if (!result) {
+                this->emitErrorMessage("init()", "Failed to connect blocks in graph");
+            }
         }
         graph::forEachBlock<TransparentBlockGroup>(*_graph, [this](auto& block) { this->emitErrorMessageIfAny("resume() -> LifecycleState", block->changeStateTo(RUNNING)); });
         if constexpr (requires(Derived& d) { d.customResume(); }) {
             static_cast<Derived*>(this)->customResume();
+        }
+    }
+
+    void adoptBlock(const std::shared_ptr<BlockModel>& newBlock) {
+        using enum lifecycle::State;
+        if (const auto connectResult = _toChildMessagePort.connect(*newBlock->msgIn); !connectResult.has_value()) {
+            this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", newBlock->uniqueName()));
+        }
+        auto toSchedulerBuffer = _fromChildMessagePort.buffer();
+        newBlock->msgOut->setBuffer(toSchedulerBuffer.streamBuffer, toSchedulerBuffer.tagBuffer);
+
+        if (!lifecycle::isActive(this->state())) {
+            return;
+        }
+
+        const auto nBatches = _adoptionBlocks.size();
+        if (nBatches == 0) {
+            return;
+        }
+        std::lock_guard guard(_adoptionBlocksMutex);
+
+        auto runnerIndex = std::hash<BlockModel*>{}(newBlock.get()) % nBatches;
+        _adoptionBlocks[runnerIndex].push_back(newBlock);
+        switch (newBlock->state()) {
+        case STOPPED:
+        case IDLE: //
+            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(INITIALISED));
+            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(RUNNING));
+            break;
+        case INITIALISED: //
+            this->emitErrorMessageIfAny("adoptBlock -> INITIALIZED", newBlock->changeStateTo(RUNNING));
+            break;
+        default: this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("Unexpected block state during emplacement: {}", gr::meta::enumName(newBlock->state()).value_or("")));
         }
     }
 
@@ -746,78 +861,106 @@ protected:
         assert(propertyName == scheduler::property::kEmplaceBlock);
         using namespace std::string_literals;
         const auto& messageData = message.data.value();
-        const auto  type        = messageData.at("type").value_or(std::string_view{});
-
-        if (type.empty()) {
-            message.data = std::unexpected(Error{std::format("No type specified for the message {}", message)});
-            return message;
-        }
-
-        const property_map& properties = [&] {
-            if (auto it = messageData.find("properties"); it != messageData.end()) {
-                auto* result = it->second.get_if<property_map>();
-                if (result == nullptr) {
-                    return property_map{};
-                } else {
-                    return *result;
-                }
-            } else {
-                return property_map{};
-            }
-        }();
 
         message.endpoint = scheduler::property::kBlockEmplaced;
 
         auto* targetGraph = findTargetSubGraph(messageData);
-
         if (targetGraph == nullptr) {
             message.data = std::unexpected(Error{std::format("No target graph for the message {}", message)});
             return message;
         }
 
-        auto& newBlock = targetGraph->emplaceBlock(type, properties);
+        std::string  blockType;
+        property_map blockProperties;
 
-        if (ConnectionResult::SUCCESS != _toChildMessagePort.connect(*newBlock->msgIn)) {
-            this->emitErrorMessage("connectBlockMessagePorts()", std::format("Failed to connect scheduler input message port to child '{}'", newBlock->uniqueName()));
-        }
+        if (auto yamlIt = messageData.find("yaml"); yamlIt != messageData.end()) {
+            // YAML path: create block from a serialised block definition string
+            const auto yamlStr = yamlIt->second.value_or(std::string_view{});
+            if (yamlStr.empty()) {
+                message.data = std::unexpected(Error{"yaml field is empty"s});
+                return message;
+            }
+            auto parsed = pmt::yaml::deserialize(yamlStr);
+            if (!parsed) {
+                message.data = std::unexpected(Error{std::format("Could not parse yaml: {}", parsed.error().message)});
+                return message;
+            }
 
-        auto toSchedulerBuffer = _fromChildMessagePort.buffer();
-        newBlock->msgOut->setBuffer(toSchedulerBuffer.streamBuffer, toSchedulerBuffer.tagBuffer);
+            if (auto idIt = parsed->find("id"); idIt != parsed->end()) {
+                blockType = std::string(idIt->second.value_or(std::string_view{}));
+            }
+            if (blockType.empty()) {
+                message.data = std::unexpected(Error{"yaml block definition is missing id field"s});
+                return message;
+            }
 
-        if (lifecycle::isActive(this->state())) {
-            // Block is being added while scheduler is running. Will be adopted by a thread.
-            const auto nBatches = _adoptionBlocks.size();
-            if (nBatches > 0) {
-                std::lock_guard guard(_adoptionBlocksMutex);
-                // pseudo-randomize which thread gets it
-                auto blockAddress = reinterpret_cast<std::uintptr_t>(&newBlock);
-                auto runnerIndex  = (blockAddress / sizeof(void*)) % nBatches;
-                _adoptionBlocks[runnerIndex].push_back(newBlock);
+            if (blockType == "SUBGRAPH") {
+                // Wrap the single block definition so loadGraphFromMap can process it
+                property_map       graphMap;
+                Tensor<pmt::Value> blocksSeq;
+                blocksSeq.push_back(pmt::Value(*parsed));
+                graphMap["blocks"] = std::move(blocksSeq);
 
-                switch (newBlock->state()) {
-                case STOPPED:
-                case IDLE: //
-                    this->emitErrorMessageIfAny("adoptBlocks -> INITIALIZED", newBlock->changeStateTo(INITIALISED));
-                    this->emitErrorMessageIfAny("adoptBlocks -> INITIALIZED", newBlock->changeStateTo(RUNNING));
-                    break;
-                case INITIALISED: //
-                    this->emitErrorMessageIfAny("adoptBlocks -> INITIALIZED", newBlock->changeStateTo(RUNNING));
-                    break;
-                case RUNNING:
-                case REQUESTED_PAUSE:
-                case PAUSED:
-                case REQUESTED_STOP:
-                case ERROR: //
-                    this->emitErrorMessage("propertyCallbackEmplaceBlock", std::format("Unexpected block state during emplacement: {}", magic_enum::enum_name(newBlock->state())));
-                    break;
+                const std::size_t blocksBefore = targetGraph->blocks().size();
+                try {
+                    detail::loadGraphFromMap(gr::globalPluginLoader(), *targetGraph, std::move(graphMap));
+                } catch (const std::exception& e) {
+                    message.data = std::unexpected(Error{std::format("Failed to create subgraph from yaml: {}", e.what())});
+                    return message;
+                }
+
+                const auto& blocks = targetGraph->blocks();
+                if (blocks.size() <= blocksBefore) {
+                    message.data = std::unexpected(Error{"No block was added from yaml"s});
+                    return message;
+                }
+
+                for (std::size_t i = blocksBefore; i < blocks.size(); ++i) {
+                    adoptBlock(blocks[i]);
+                }
+
+                auto replyData            = serializeBlock(gr::globalPluginLoader(), blocks[blocksBefore], BlockSerializationFlags::All);
+                replyData["_targetGraph"] = targetGraph->unique_name.value();
+                this->emitMessage(scheduler::property::kBlockEmplaced, std::move(replyData));
+                return {};
+            }
+
+            // Normal block from YAML: read parameters, stripping auto-generated system fields
+            if (auto it = parsed->find("parameters"); it != parsed->end()) {
+                if (const auto* p = it->second.get_if<property_map>()) {
+                    blockProperties = *p;
+                    blockProperties.erase("unique_name"); // auto-generated, not user-settable
+                }
+            }
+        } else {
+            // Non-YAML path: read type and properties directly from the message
+            blockType = std::string(messageData.at("type").value_or(std::string_view{}));
+            if (blockType.empty()) {
+                message.data = std::unexpected(Error{std::format("No type specified for the message {}", message)});
+                return message;
+            }
+            if (auto it = messageData.find("properties"); it != messageData.end()) {
+                if (const auto* result = it->second.get_if<property_map>()) {
+                    blockProperties = *result;
                 }
             }
         }
 
-        auto replyData = serializeBlock(gr::globalPluginLoader(), newBlock, BlockSerializationFlags::All);
+        // For the YAML path, settings from the serialised block definition are applied
+        // via loadParametersFromPropertyMap after emplacement
+        const bool   isYamlPath   = messageData.contains("yaml");
+        property_map yamlSettings = isYamlPath ? std::exchange(blockProperties, {}) : property_map{};
 
+        auto& newBlock = targetGraph->emplaceBlock(blockType, blockProperties);
+
+        if (isYamlPath && !yamlSettings.empty()) {
+            newBlock->settings().loadParametersFromPropertyMap(yamlSettings);
+        }
+
+        adoptBlock(newBlock);
+
+        auto replyData            = serializeBlock(gr::globalPluginLoader(), newBlock, BlockSerializationFlags::All);
         replyData["_targetGraph"] = targetGraph->unique_name.value();
-
         this->emitMessage(scheduler::property::kBlockEmplaced, std::move(replyData));
 
         // Message is sent as a reaction to emplaceBlock, no need for a separate one
@@ -844,8 +987,11 @@ protected:
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
-        auto removedBlock           = targetGraph->removeBlockByName(uniqueName);
-        makeZombie(std::move(removedBlock));
+        if (auto removedBlock = targetGraph->removeBlockByName(uniqueName); removedBlock.has_value()) {
+            makeZombie(std::move(*removedBlock));
+        } else {
+            message.data = std::unexpected(removedBlock.error());
+        }
 
         return {message};
     }
@@ -871,7 +1017,12 @@ protected:
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
-        targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort);
+        {
+            WorkQuiescenceGuard quiescence(this);
+            if (auto result = targetGraph->removeEdgeBySourcePort(sourceBlock, sourcePort); !result.has_value()) {
+                message.data = std::unexpected(result.error());
+            }
+        }
 
         return message;
     }
@@ -903,7 +1054,13 @@ protected:
         }
 
         messageData["_targetGraph"] = targetGraph->unique_name.value();
-        targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), *minBufferSize, *weight, edgeName);
+        {
+            WorkQuiescenceGuard quiescence(this);
+            const std::size_t   effectiveMinBufferSize = (*minBufferSize == gr::undefined_Size) ? gr::undefined_size : static_cast<std::size_t>(*minBufferSize);
+            if (auto result = targetGraph->emplaceEdge(sourceBlock, std::string(sourcePort), destinationBlock, std::string(destinationPort), effectiveMinBufferSize, *weight, edgeName); !result.has_value()) {
+                message.data = std::unexpected(result.error());
+            }
+        }
 
         return message;
     }
@@ -1100,23 +1257,38 @@ protected:
 
     std::optional<Message> propertyCallbackSchedulerInspect([[maybe_unused]] std::string_view propertyName, Message message) {
         assert(propertyName == scheduler::property::kSchedulerInspect);
-        message.data = [&] {
-            property_map result;
-            result[std::pmr::string(serialization_fields::BLOCK_NAME)]        = std::string(this->name);
-            result[std::pmr::string(serialization_fields::BLOCK_UNIQUE_NAME)] = std::string(this->unique_name);
-            result[std::pmr::string(serialization_fields::BLOCK_CATEGORY)]    = std::string(magic_enum::enum_name(blockCategory));
 
-            // Requesting graph serialization
-            property_map serializedChildren;
-            auto         graphData = _graph->propertyCallbackGraphInspect(graph::property::kGraphInspect, {});
-            if (!graphData.has_value()) {
+        if (const bool yamlSerialize =
+                [&] {
+                    if (!message.data) {
+                        return false;
+                    }
+                    if (const auto it = message.data->find("serialization_format"); it != message.data->cend()) {
+                        return it->second == "yaml";
+                    }
+                    return false;
+                }();
+            !yamlSerialize) {
+            message.data = [&] {
+                property_map result;
+                result[std::pmr::string(serialization_fields::BLOCK_NAME)]        = std::string(this->name);
+                result[std::pmr::string(serialization_fields::BLOCK_UNIQUE_NAME)] = std::string(this->unique_name);
+                result[std::pmr::string(serialization_fields::BLOCK_CATEGORY)]    = std::string(gr::meta::enumName(blockCategory).value_or(""));
+
+                // Requesting graph serialization
+                property_map serializedChildren;
+                auto         graphData = _graph->propertyCallbackGraphInspect(graph::property::kGraphInspect, {});
+                if (!graphData.has_value()) {
+                    return result;
+                }
+                serializedChildren[std::pmr::string(_graph->unique_name)] = graphData->data.value();
+
+                result[std::pmr::string(serialization_fields::BLOCK_CHILDREN)] = std::move(serializedChildren);
                 return result;
-            }
-            serializedChildren[std::pmr::string(_graph->unique_name)] = graphData->data.value();
-
-            result[std::pmr::string(serialization_fields::BLOCK_CHILDREN)] = std::move(serializedChildren);
-            return result;
-        }();
+            }();
+        } else {
+            message.data = {{"yamlData", saveGrc(gr::globalPluginLoader(), *_graph)}};
+        }
 
         message.endpoint = scheduler::property::kSchedulerInspected;
         return message;
@@ -1196,6 +1368,7 @@ struct Simple : SchedulerBase<Simple<execution, TProfiler>, execution, TProfiler
         }
 
         std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
         this->_adoptionBlocks.clear();
         this->_adoptionBlocks.resize(n_batches);
         this->_executionOrder->clear();
@@ -1300,8 +1473,8 @@ detecting cycles and blocks which can be reached from several source blocks.)"">
 
         const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? std::min(static_cast<std::size_t>(this->_pool->maxThreads()), blockList.size()) : 1UZ;
 
-        std::lock_guard guard(this->_adoptionBlocksMutex);
         std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
         this->_adoptionBlocks.clear();
         this->_adoptionBlocks.resize(n_batches);
         *this->_executionOrder = detail::batchBlocks(blockList, n_batches);
@@ -1363,8 +1536,8 @@ struct DepthFirst : SchedulerBase<DepthFirst<execution, TProfiler>, execution, T
 
         const std::size_t n_batches = (execution == ExecutionPolicy::multiThreaded) ? std::min(static_cast<std::size_t>(this->_pool->maxThreads()), blockList.size()) : 1UZ;
 
-        std::lock_guard guard(this->_adoptionBlocksMutex);
         std::lock_guard lock(this->_executionOrderMutex);
+        std::lock_guard guard(this->_adoptionBlocksMutex);
         this->_adoptionBlocks.clear();
         this->_adoptionBlocks.resize(n_batches);
         *this->_executionOrder = detail::batchBlocks(blockList, n_batches);

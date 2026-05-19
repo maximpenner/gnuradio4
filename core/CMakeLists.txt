@@ -2,6 +2,9 @@ add_library(
   gnuradio-core STATIC
   src/Value.cpp
   src/ValueHelper.cpp
+  src/Block.cpp
+  src/BlockModel.cpp
+  src/Settings.cpp
   src/Graph.cpp
   src/PluginLoader.cpp
   src/PmtTypeHelpers.cpp)
@@ -10,6 +13,7 @@ set(public_headers
     include/gnuradio-4.0/annotated.hpp
     include/gnuradio-4.0/AtomicBitset.hpp
     include/gnuradio-4.0/Block.hpp
+    include/gnuradio-4.0/BlockMerging.hpp
     include/gnuradio-4.0/BlockModel.hpp
     include/gnuradio-4.0/BlockTraits.hpp
     include/gnuradio-4.0/Buffer.hpp
@@ -45,6 +49,7 @@ set(public_headers
     include/gnuradio-4.0/YamlPmt.hpp)
 
 set_target_properties(gnuradio-core PROPERTIES PUBLIC_HEADER "${public_headers}")
+add_library(gnuradio4::gnuradio-core ALIAS gnuradio-core)
 target_include_directories(
   gnuradio-core
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/>
@@ -56,14 +61,17 @@ target_link_libraries(
   gnuradio-core
   PUBLIC gnuradio-options
          gnuradio-meta
+         gnuradio-algorithm
          magic_enum
          vir)
 
 add_library(gnuradio-blocklib-core SHARED src/BlockRegistry.cpp)
-set_target_properties(gnuradio-blocklib-core
-                      PROPERTIES PUBLIC_HEADER "include/gnuradio-4.0/BlockRegistry.hpp include/gnuradio-4.0/Plugin.hpp")
+set(blocklib_public_headers include/gnuradio-4.0/BlockRegistry.hpp include/gnuradio-4.0/Plugin.hpp)
+set_target_properties(gnuradio-blocklib-core PROPERTIES PUBLIC_HEADER "${blocklib_public_headers}")
+add_library(gnuradio4::gnuradio-blocklib-core ALIAS gnuradio-blocklib-core)
 message(INFO "PATH include " $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>)
-target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/>)
+target_include_directories(gnuradio-blocklib-core PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/>
+                                                         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(gnuradio-blocklib-core PUBLIC gnuradio-core)
 if(WIN32)
   target_compile_definitions(gnuradio-core PUBLIC BUILDING_MYPLUGIN)
@@ -79,8 +87,11 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/include/gnuradio-4.0/config.hpp"
         DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/gnuradio-4.0")
 
 install(
-  TARGETS gnuradio-core
+  TARGETS gnuradio-core gnuradio-blocklib-core
   EXPORT gnuradio4Targets
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   PUBLIC_HEADER DESTINATION include/gnuradio-4.0)
 
 # Just install the entire include directory
@@ -90,5 +101,7 @@ add_subdirectory(src)
 
 if(ENABLE_TESTING)
   add_subdirectory(test)
+endif()
+if(ENABLE_BENCHMARKS)
   add_subdirectory(benchmarks)
 endif()

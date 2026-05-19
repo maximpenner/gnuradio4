@@ -6,6 +6,7 @@
 
 #include <benchmark.hpp>
 
+#include <gnuradio-4.0/BlockMerging.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Tag.hpp>
 
@@ -19,26 +20,22 @@ template<typename T, std::size_t min = 0UZ, std::size_t count = N_MAX, bool use_
 struct source : public gr::Block<source<T, min, count>> {
     gr::PortOut<T> out;
 
-    gr::Size_t n_samples_max;
+    gr::Size_t n_samples_max = 0U;
 
     GR_MAKE_REFLECTABLE(source, out, n_samples_max);
 
-    friend constexpr std::size_t available_samples(const source& self) noexcept { return self.n_samples_max - n_samples_produced; }
+    void reset() { n_samples_produced = 0UZ; }
 
-    [[nodiscard]] constexpr auto processOne_simd(auto N) const noexcept -> vir::simdize<T, decltype(N)::value> {
-        n_samples_produced += N;
-        vir::simdize<T, N> x{};
-        benchmark::force_to_memory(x);
-        return x;
-    }
-
-    [[nodiscard]] constexpr T processOne() const noexcept {
+    [[nodiscard]] constexpr T processOne() noexcept {
         n_samples_produced++;
+        if (n_samples_max > 0 && n_samples_produced >= n_samples_max) {
+            this->requestStop();
+        }
         T x{};
         benchmark::force_to_memory(x);
         return x;
     }
-}; // namespace bm::test
+};
 
 inline static std::size_t n_samples_consumed = 0UZ;
 
@@ -50,16 +47,15 @@ struct sink : public gr::Block<sink<T, N_MIN, N_MAX>> {
 
     GR_MAKE_REFLECTABLE(sink, in, should_receive_n_samples);
 
+    void reset() { n_samples_consumed = 0UZ; }
+
     [[nodiscard]] constexpr auto processOne(T a) noexcept {
-        // optional user-level tag processing
         if (this->inputTagsPresent()) {
-            if (this->inputTagsPresent() && this->mergedInputTag().map.contains("N_SAMPLES_MAX")) {
-                const auto value = this->mergedInputTag().map.at("N_SAMPLES_MAX");
-                if (value.template holds<uint64_t>()) { // should be std::size_t but emscripten/pmtv seem to have issues with it
-                    if (auto ptr = value.template get_if<std::uint64_t>()) {
-                        should_receive_n_samples = *ptr;
-                        _last_tag_position       = in.streamReader().position();
-                    }
+            const auto& tag = this->mergedInputTag();
+            if (auto it = tag.map.find("N_SAMPLES_MAX"); it != tag.map.end()) {
+                if (auto ptr = it->second.template get_if<std::uint64_t>()) {
+                    should_receive_n_samples = *ptr;
+                    _last_tag_position       = in.streamReader().position();
                 }
             }
         }
@@ -69,14 +65,21 @@ struct sink : public gr::Block<sink<T, N_MIN, N_MAX>> {
     }
 };
 
-template<std::size_t N, typename base, typename aggregate>
-constexpr auto cascade(aggregate&& src, std::function<base()> generator = [] { return base(); }) {
-    if constexpr (N <= 1) {
-        return src;
-    } else {
-        return cascade<N - 1, base>(gr::mergeByIndex<0, 0>(std::forward<aggregate>(src), generator()), generator);
-    }
-}
+template<std::size_t N, typename Base, typename Aggregate>
+struct CascadeTypeHelper;
+
+template<typename Base, typename Aggregate>
+struct CascadeTypeHelper<0, Base, Aggregate> {
+    using type = Base;
+};
+
+template<std::size_t N, typename Base, typename Aggregate>
+struct CascadeTypeHelper {
+    using type = gr::MergeByIndex<typename CascadeTypeHelper<N - 1, Base, Aggregate>::type, 0, Base, 0>;
+};
+
+template<std::size_t N, typename Base>
+using CascadeType = typename CascadeTypeHelper<N, Base, Base>::type;
 
 } // namespace bm::test
 

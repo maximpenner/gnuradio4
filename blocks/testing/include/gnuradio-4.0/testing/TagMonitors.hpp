@@ -1,6 +1,7 @@
 #ifndef GNURADIO_TAGMONITORS_HPP
 #define GNURADIO_TAGMONITORS_HPP
 
+#include <complex>
 #include <limits>
 
 #include <gnuradio-4.0/Block.hpp>
@@ -10,6 +11,25 @@
 #include <gnuradio-4.0/meta/reflection.hpp>
 
 namespace gr::testing {
+
+namespace detail {
+
+template<typename T>
+struct SampleValueConverter {
+    static constexpr T make(std::size_t value) { return static_cast<T>(value); }
+};
+
+template<typename T>
+struct SampleValueConverter<std::complex<T>> {
+    static constexpr std::complex<T> make(std::size_t value) { return std::complex<T>{static_cast<T>(value), T{0}}; }
+};
+
+template<typename T>
+[[nodiscard]] constexpr T make_sample_value(std::size_t value) {
+    return SampleValueConverter<T>::make(value);
+}
+
+} // namespace detail
 
 enum class ProcessFunction {
     USE_PROCESS_BULK = 0, ///
@@ -63,24 +83,33 @@ inline constexpr void mismatch_report(const IterType& mismatchedTag1, const Iter
     }
 }
 
-inline constexpr bool equal_tag_lists(const std::vector<Tag>& tags1, const std::vector<Tag>& tags2, const std::optional<std::vector<std::string>>& ignoreKeys = std::nullopt) {
+inline constexpr bool equal_tag_lists(const std::vector<Tag>& tags1, const std::vector<Tag>& tags2, const std::optional<std::vector<std::string>>& ignoreKeys = std::nullopt, std::ptrdiff_t indexTolerance = 0) {
     if (tags1.size() != tags2.size()) {
         std::println("vectors have different sizes ({} vs {})\n", tags1.size(), tags2.size());
         return false;
     }
 
-    auto customComparator = [&ignoreKeys](const Tag& tag1, const Tag& tag2) {
-        if (ignoreKeys != std::nullopt && !ignoreKeys.value().empty()) {
-            // make a copy of the maps to compare without the ignored key
-            auto map1 = tag1.map;
-            auto map2 = tag2.map;
-            for (const auto& ignoreKey : ignoreKeys.value()) {
-                map1.erase(convert_string_domain(ignoreKey));
-                map2.erase(convert_string_domain(ignoreKey));
+    auto customComparator = [&ignoreKeys, indexTolerance](const Tag& tag1, const Tag& tag2) {
+        auto mapsEqual = [&]() {
+            if (ignoreKeys != std::nullopt && !ignoreKeys.value().empty()) {
+                auto map1 = tag1.map;
+                auto map2 = tag2.map;
+                for (const auto& ignoreKey : ignoreKeys.value()) {
+                    map1.erase(convert_string_domain(ignoreKey));
+                    map2.erase(convert_string_domain(ignoreKey));
+                }
+                return map1 == map2;
             }
-            return map1 == map2;
-        }
-        return tag1 == tag2; // Use Tag's equality operator
+            return tag1.map == tag2.map;
+        };
+        auto indexClose = [&]() {
+            if (indexTolerance == 0) {
+                return tag1.index == tag2.index;
+            }
+            auto diff = static_cast<std::ptrdiff_t>(tag1.index) - static_cast<std::ptrdiff_t>(tag2.index);
+            return diff >= -indexTolerance && diff <= indexTolerance;
+        };
+        return indexClose() && mapsEqual();
     };
 
     auto [mismatchedTag1, mismatchedTag2] = std::mismatch(tags1.begin(), tags1.end(), tags2.begin(), customComparator);
@@ -156,7 +185,7 @@ struct TagSource : Block<TagSource<T, UseProcessVariant>> {
             _valueIndex++;
             return currentValue;
         }
-        return mark_tag ? (nGeneratedTags > 0 ? static_cast<T>(1) : static_cast<T>(0)) : static_cast<T>(_nSamplesProduced);
+        return mark_tag ? (nGeneratedTags > 0 ? detail::make_sample_value<T>(std::size_t{1}) : detail::make_sample_value<T>(std::size_t{0})) : detail::make_sample_value<T>(_nSamplesProduced);
     }
 
     work::Status processBulk(OutputSpanLike auto& outSpan) noexcept
@@ -194,10 +223,10 @@ struct TagSource : Block<TagSource<T, UseProcessVariant>> {
             }
         } else {
             if (mark_tag) {
-                outSpan[0] = nGeneratedTags > 0 ? static_cast<T>(1) : static_cast<T>(0);
+                outSpan[0] = nGeneratedTags > 0 ? detail::make_sample_value<T>(std::size_t{1}) : detail::make_sample_value<T>(std::size_t{0});
             } else {
                 for (std::size_t i = 0; i < nSamples; ++i) {
-                    outSpan[i] = static_cast<T>(_nSamplesProduced + i);
+                    outSpan[i] = detail::make_sample_value<T>(_nSamplesProduced + i);
                 }
             }
         }
@@ -237,7 +266,6 @@ private:
             if (_tagCallback) {
                 _tagCallback(_tags[_tagIndex]);
             }
-            this->_outputTagsChanged = true;
             _tagIndex++;
             result.nGeneratedTags++;
         } while (_tagIndex < _tags.size() && _tags[_tagIndex].index == targetIndex);
@@ -295,7 +323,7 @@ struct TagMonitor : public Block<TagMonitor<T, UseProcessVariant>> {
     requires(UseProcessVariant == ProcessFunction::USE_PROCESS_ONE)
     {
         if (this->inputTagsPresent()) {
-            const Tag& tag = this->mergedInputTag();
+            const auto& tag = this->mergedInputTag();
             if (verbose_console) {
                 print_tag(tag, std::format("{}::processOne(...)\t received tag at {:6}", this->name, _nSamplesProduced));
             }
@@ -313,16 +341,16 @@ struct TagMonitor : public Block<TagMonitor<T, UseProcessVariant>> {
         return input;
     }
 
-    constexpr work::Status processBulk(std::span<const T> input, std::span<T> output) noexcept
+    constexpr work::Status processBulk(InputSpanLike auto& input, OutputSpanLike auto& output) noexcept
     requires(UseProcessVariant == ProcessFunction::USE_PROCESS_BULK)
     {
-        if (this->inputTagsPresent()) {
-            const Tag& tag = this->mergedInputTag();
+        for (const auto& [relIndex, tagMapRef] : input.tags()) {
+            const Tag tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()};
             if (verbose_console) {
                 print_tag(tag, std::format("{}::processBulk(...{}, ...{})\t received tag at {:6}", this->name, input.size(), output.size(), _nSamplesProduced));
             }
             if (log_tags) {
-                const auto& newTag = _tags.emplace_back(_nSamplesProduced, tag.map);
+                const auto& newTag = _tags.emplace_back(_nSamplesProduced + tag.index, tag.map);
                 if (_tagCallback) {
                     _tagCallback(newTag);
                 }
@@ -386,9 +414,9 @@ struct TagSink : public Block<TagSink<T, UseProcessVariant>> {
     requires(UseProcessVariant == ProcessFunction::USE_PROCESS_ONE)
     {
         if (this->inputTagsPresent()) {
-            const Tag& tag = this->mergedInputTag();
+            const auto& tag = this->mergedInputTag();
             if (verbose_console) {
-                print_tag(tag, std::format("{}::processOne(...1)    \t received tag at {:6}", this->name, _nSamplesProduced));
+                print_tag(tag, std::format("{}::processOne(...1)\t received tag at {:6}", this->name, _nSamplesProduced));
             }
             if (log_tags) {
                 const auto& newTag = _tags.emplace_back(_nSamplesProduced, tag.map);
@@ -406,17 +434,16 @@ struct TagSink : public Block<TagSink<T, UseProcessVariant>> {
         }
     }
 
-    // template<gr::meta::t_or_simd<T> V>
-    constexpr work::Status processBulk(std::span<const T> input)
+    constexpr work::Status processBulk(InputSpanLike auto& input)
     requires(UseProcessVariant == ProcessFunction::USE_PROCESS_BULK)
     {
-        if (this->inputTagsPresent()) {
-            const Tag& tag = this->mergedInputTag();
+        for (const auto& [relIndex, tagMapRef] : input.tags()) {
+            const Tag tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()};
             if (verbose_console) {
                 print_tag(tag, std::format("{}::processBulk(...{})\t received tag at {:6}", this->name, input.size(), _nSamplesProduced));
             }
             if (log_tags) {
-                const auto& newTag = _tags.emplace_back(_nSamplesProduced, tag.map);
+                const auto& newTag = _tags.emplace_back(_nSamplesProduced + tag.index, tag.map);
                 if (_tagCallback) {
                     _tagCallback(newTag);
                 }

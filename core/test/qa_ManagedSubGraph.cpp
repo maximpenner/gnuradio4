@@ -40,8 +40,12 @@ struct DemoSubSchedulerResult {
 
     DemoSubSchedulerResult() {}
 
+    // Dedicated pool for nested sub-schedulers: prevents deadlock when the outer
+    // multiThreaded scheduler already holds every slot of the 2-thread default_cpu pool.
+    static constexpr std::string_view kSubSchedulerPoolId = "sub_scheduler_cpu";
+
     void setGraph(gr::Graph&& graph) {
-        scheduler           = std::static_pointer_cast<BlockModel>(std::make_shared<Wrapper>());
+        scheduler           = std::static_pointer_cast<BlockModel>(std::make_shared<Wrapper>(gr::property_map{{"poolName", std::string(kSubSchedulerPoolId)}}));
         schedulerUniqueName = scheduler->uniqueName();
         wrapper             = static_cast<Wrapper*>(scheduler.get());
         wrapper->setGraph(std::move(graph));
@@ -54,7 +58,11 @@ DemoSubSchedulerResult<T> createDemoSubScheduler() {
     gr::Graph                 graph;
     result.pass1 = std::addressof(graph.template emplaceBlock<gr::testing::Copy<T>>());
     result.pass2 = std::addressof(graph.template emplaceBlock<gr::testing::Copy<T>>());
-    expect(eq(ConnectionResult::SUCCESS, graph.connect(*result.pass1, PortDefinition("out"), *result.pass2, PortDefinition("in"))));
+    // We have a delayed connection to CountingSink, the scheduler shouldn't
+    // stop before the connection is established just because pass2 doesn't
+    // have a downstream connection yet
+    result.pass2->disconnect_on_done = false;
+    expect(graph.connect(*result.pass1, "out", *result.pass2, "in").has_value());
     result.setGraph(std::move(graph));
     return result;
 }
@@ -66,7 +74,7 @@ DemoSubSchedulerResult<T> createDemoSubSchedulerWithSettings() {
     result.pass1            = std::addressof(graph.template emplaceBlock<gr::testing::Copy<T>>());
     result.pass2            = std::addressof(graph.template emplaceBlock<gr::testing::Copy<T>>());
     result.settingsRecorder = std::addressof(graph.template emplaceBlock<gr::testing::SettingsChangeRecorder<T>>());
-    expect(eq(ConnectionResult::SUCCESS, graph.connect(*result.pass1, PortDefinition("out"), *result.pass2, PortDefinition("in"))));
+    expect(graph.connect(*result.pass1, "out", *result.pass2, "in").has_value());
     result.setGraph(std::move(graph));
     return result;
 }
@@ -91,6 +99,13 @@ const boost::ut::suite BasicSchedulerWrapperTests = [] {
 void setCustomDefaultThreadPool() {
     auto cpu = std::make_shared<thread_pool::ThreadPoolWrapper>(std::make_unique<thread_pool::BasicThreadPool>(std::string(thread_pool::kDefaultCpuPoolId), thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU");
     gr::thread_pool::Manager::instance().replacePool(std::string(thread_pool::kDefaultCpuPoolId), std::move(cpu));
+
+    auto subCpu = std::make_shared<thread_pool::ThreadPoolWrapper>(std::make_unique<thread_pool::BasicThreadPool>(std::string(DemoSubSchedulerResult<float>::kSubSchedulerPoolId), thread_pool::TaskType::CPU_BOUND, 2U, 2U), "CPU");
+    try {
+        gr::thread_pool::Manager::instance().registerPool(std::string(DemoSubSchedulerResult<float>::kSubSchedulerPoolId), std::move(subCpu));
+    } catch (const std::invalid_argument&) {
+        // already registered by a previous test suite — reuse existing instance
+    }
 }
 
 const boost::ut::suite ManagedSubGraph = [] {
@@ -107,7 +122,7 @@ const boost::ut::suite ManagedSubGraph = [] {
         gr::Graph graph;
 
         // Basic source and sink
-        [[maybe_unused]] auto& source = graph.emplaceBlock<SlowSource<float>>();
+        [[maybe_unused]] auto& source = graph.emplaceBlock<SlowSource<float>>({{"disconnect_on_done", false}});
         [[maybe_unused]] auto& sink   = graph.emplaceBlock<CountingSink<float>>();
 
         // Sub-scheduler with a single block inside
@@ -129,25 +144,31 @@ const boost::ut::suite ManagedSubGraph = [] {
 
         gr::MsgPortOut toScheduler;
         gr::MsgPortIn  fromScheduler;
-        expect(eq(ConnectionResult::SUCCESS, toScheduler.connect(scheduler.msgIn)));
-        expect(eq(ConnectionResult::SUCCESS, scheduler.msgOut.connect(fromScheduler)));
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
 
         expect(scheduler.state() == lifecycle::State::IDLE) << std::format("scheduler state should be IDLE - actual: {}", magic_enum::enum_name(scheduler.state()));
 
         auto schedulerThreadHandle = gr::test::thread_pool::executeScheduler("qa_ManagedSubGraph", scheduler);
 
-        expect(awaitCondition(2s, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler is not running";
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler is not running";
 
         // Check the state of the sub-blocks before the state of the sub-scheduler, as the scheduler might be running
         // but still updating children states
         expect(eq(subGraph->blocks().size(), 2UZ)) << "subGraph should have 2 blocks";
         expect(eq(scheduler.graph().blocks().size(), 3UZ)) << "Graph should contain source->(copy->copy)->sink";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[0]->state() == lifecycle::State::RUNNING; })) << "block 0 is not running";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[1]->state() == lifecycle::State::RUNNING; })) << "block 1 is not running";
 
+        auto allSubBlocksInState = [&subGraph](lifecycle::State target) { return std::ranges::all_of(subGraph->blocks(), [target](const auto& b) { return b->state() == target; }); };
+        auto subBlockStates      = [&subGraph] {
+            std::string result;
+            for (const auto& b : subGraph->blocks()) {
+                result += std::format("  {} -> {}\n", b->uniqueName(), magic_enum::enum_name(b->state()));
+            }
+            return result;
+        };
+
+        expect(awaitCondition(scheduler, [&] { return allSubBlocksInState(lifecycle::State::RUNNING); })) << std::format("not all sub-graph blocks are RUNNING:\n{}", subBlockStates());
         expect(subSchedulerBlock->state() == lifecycle::State::RUNNING) << "sub-scheduler is not running";
-
-        std::expected<void, Error> schedulerRet;
 
         testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.wrapper->uniqueName(), graph::property::kSubgraphExportPort, //
             property_map{{"uniqueBlockName", std::string(demo.pass2->unique_name)}, {"portDirection", "output"}, {"portName", "out"}, {"exportedName", "outExp"}, {"exportFlag", true}}, [](const Message& reply) { return reply.endpoint == graph::property::kSubgraphExportedPort; });
@@ -192,25 +213,24 @@ const boost::ut::suite ManagedSubGraph = [] {
             expect(eq(subGraphOutConnections, 1UZ));
 
             // Check subgraph topology
-            const auto& subGraphData     = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.wrapper->uniqueName())));
-            const auto& subGraphChildren = gr::test::get_value_or_fail<property_map>(subGraphData.at("children"));
-            const auto& subGraphEdges    = gr::test::get_value_or_fail<property_map>(subGraphData.at("edges"));
-            expect(eq(subGraphChildren.size(), 2UZ));
-            expect(eq(subGraphEdges.size(), 1UZ));
+            const auto& subGraphData   = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.wrapper->uniqueName())));
+            const auto& subGraphGraph  = gr::test::get_value_or_fail<property_map>(subGraphData.at("graph"));
+            const auto& subGraphBlocks = gr::test::get_value_or_fail<Tensor<pmt::Value>>(subGraphGraph.at("blocks"));
+            const auto& subGraphConns  = gr::test::get_value_or_fail<Tensor<pmt::Value>>(subGraphGraph.at("connections"));
+            expect(eq(subGraphBlocks.size(), 2UZ));
+            expect(eq(subGraphConns.size(), 1UZ));
         }
 
         // Pause scheduler
         expect(scheduler.state() == lifecycle::State::RUNNING) << std::format("scheduler should be running before pause - actual: {}", magic_enum::enum_name(scheduler.state()));
         expect(scheduler.changeStateTo(lifecycle::State::REQUESTED_PAUSE).has_value()) << "could switch to REQUESTED_PAUSE?";
 
-        expect(awaitCondition(2s, [&scheduler] { return scheduler.state() == lifecycle::State::PAUSED; })) << std::format("scheduler should be paused - actual: {}", magic_enum::enum_name(scheduler.state()));
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[0]->state() == lifecycle::State::PAUSED; })) << "block 0 is not paused";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[1]->state() == lifecycle::State::PAUSED; })) << "block 1 is not paused";
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::PAUSED; })) << std::format("scheduler should be paused - actual: {}", magic_enum::enum_name(scheduler.state()));
+        expect(awaitCondition(scheduler, [&] { return allSubBlocksInState(lifecycle::State::PAUSED); })) << std::format("not all sub-graph blocks are PAUSED:\n{}", subBlockStates());
 
         // Resume scheduler
         expect(scheduler.changeStateTo(lifecycle::State::RUNNING).has_value()) << "could switch to RUNNING?";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[0]->state() == lifecycle::RUNNING; })) << "block 0 is not running";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[1]->state() == lifecycle::State::RUNNING; })) << "block 1 is not running";
+        expect(awaitCondition(scheduler, [&] { return allSubBlocksInState(lifecycle::State::RUNNING); })) << std::format("not all sub-graph blocks are RUNNING after resume:\n{}", subBlockStates());
         expect(scheduler.state() == lifecycle::State::RUNNING) << std::format("scheduler should be running - actual: {}", magic_enum::enum_name(scheduler.state()));
         expect(subSchedulerBlock->state() == lifecycle::State::RUNNING) << std::format("sub-scheduler should be running - actual: {}", magic_enum::enum_name(subSchedulerBlock->state()));
 
@@ -218,18 +238,22 @@ const boost::ut::suite ManagedSubGraph = [] {
 
         scheduler.requestStop();
 
-        expect(awaitCondition(1s, [&scheduler] { return scheduler.state() == lifecycle::State::STOPPED; })) << std::format("scheduler should be stopped - actual: {}", magic_enum::enum_name(scheduler.state()));
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::STOPPED; })) << std::format("scheduler should be stopped - actual: {}", magic_enum::enum_name(scheduler.state()));
+
+        auto schedulerRet = schedulerThreadHandle.get();
+        if (!schedulerRet.has_value()) {
+            expect(false) << std::format("scheduler.runAndWait() failed:\n{}\n", schedulerRet.error());
+        }
+
         expect(subSchedulerBlock->state() == lifecycle::State::STOPPED) << std::format("sub-scheduler should be stopped - actual: {}", magic_enum::enum_name(subSchedulerBlock->state()));
 
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[0]->state() == lifecycle::State::STOPPED; })) << "block 0 is not stopped";
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[1]->state() == lifecycle::State::STOPPED; })) << "block 1 is not stopped";
+        expect(awaitCondition(scheduler, [&] { return allSubBlocksInState(lifecycle::State::STOPPED); })) << std::format("not all sub-graph blocks are STOPPED:\n{}", subBlockStates());
 
         // return to initial state
         expect(scheduler.changeStateTo(lifecycle::State::INITIALISED).has_value()) << "could not switch to INITIALISED?";
-        expect(awaitCondition(1s, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; })) << "scheduler INITIALISED w/ timeout";
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; })) << "scheduler INITIALISED w/ timeout";
 
-        expect(awaitCondition(2s, [&subGraph] { return subGraph->blocks()[0]->state() == lifecycle::State::INITIALISED; })) << "block 0 is not initialized";
-        expect(subGraph->blocks()[1]->state() == lifecycle::State::INITIALISED) << "block 1 is not initialized";
+        expect(awaitCondition(scheduler, [&] { return allSubBlocksInState(lifecycle::State::INITIALISED); })) << std::format("not all sub-graph blocks are INITIALISED:\n{}", subBlockStates());
         expect(scheduler.state() == lifecycle::State::INITIALISED) << std::format("scheduler INITIALISED - actual: {}\n", magic_enum::enum_name(scheduler.state()));
         expect(subSchedulerBlock->state() == lifecycle::State::INITIALISED) << std::format("sub-scheduler should be stopped - actual: {}", magic_enum::enum_name(subSchedulerBlock->state()));
     };
@@ -245,7 +269,7 @@ const boost::ut::suite ExportPortsTests_ = [] {
         gr::Graph initGraph;
 
         // Basic source and sink
-        auto& source = initGraph.emplaceBlock<SlowSource<float>>();
+        auto& source = initGraph.emplaceBlock<SlowSource<float>>({{"disconnect_on_done", false}});
         auto& sink   = initGraph.emplaceBlock<CountingSink<float>>();
 
         auto demo = createDemoSubScheduler<float>();
@@ -259,11 +283,11 @@ const boost::ut::suite ExportPortsTests_ = [] {
         const auto&    graph = scheduler.graph();
         gr::MsgPortOut toScheduler;
         gr::MsgPortIn  fromScheduler;
-        expect(eq(ConnectionResult::SUCCESS, toScheduler.connect(scheduler.msgIn)));
-        expect(eq(ConnectionResult::SUCCESS, scheduler.msgOut.connect(fromScheduler)));
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
 
         auto schedulerThreadHandle = gr::test::thread_pool::executeScheduler("qa_HierBlock::scheduler", scheduler);
-        expect(awaitCondition(1s, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler thread up and running w/ timeout";
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler thread up and running w/ timeout";
         expect(scheduler.state() == lifecycle::State::RUNNING) << "scheduler thread up and running";
 
         testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, demo.schedulerUniqueName, graph::property::kSubgraphExportPort,                                               //
@@ -317,11 +341,12 @@ const boost::ut::suite ExportPortsTests_ = [] {
                     expect(eq(subGraphOutConnections, 1UZ));
 
                     // Check subgraph topology
-                    const auto& subGraphData     = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.schedulerUniqueName)));
-                    const auto& subGraphChildren = gr::test::get_value_or_fail<property_map>(subGraphData.at("children"));
-                    const auto& subGraphEdges    = gr::test::get_value_or_fail<property_map>(subGraphData.at("edges"));
-                    expect(eq(subGraphChildren.size(), 2UZ));
-                    expect(eq(subGraphEdges.size(), 1UZ));
+                    const auto& subGraphData   = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(demo.schedulerUniqueName)));
+                    const auto& subGraphGraph  = gr::test::get_value_or_fail<property_map>(subGraphData.at("graph"));
+                    const auto& subGraphBlocks = gr::test::get_value_or_fail<Tensor<pmt::Value>>(subGraphGraph.at("blocks"));
+                    const auto& subGraphConns  = gr::test::get_value_or_fail<Tensor<pmt::Value>>(subGraphGraph.at("connections"));
+                    expect(eq(subGraphBlocks.size(), 2UZ));
+                    expect(eq(subGraphConns.size(), 1UZ));
                     return true;
                 });
         }
@@ -336,10 +361,161 @@ const boost::ut::suite ExportPortsTests_ = [] {
         // return to initial state
         const auto initRet = scheduler.changeStateTo(lifecycle::State::INITIALISED);
         expect(initRet.has_value()) << [&initRet] { return std::format("could switch to INITIALISED - error: {}", initRet.error()); };
-        expect(awaitCondition(1s, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; })) << "scheduler INITIALISED w/ timeout";
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; })) << "scheduler INITIALISED w/ timeout";
         expect(scheduler.state() == lifecycle::State::INITIALISED) << std::format("scheduler INITIALISED - actual: {}\n", magic_enum::enum_name(scheduler.state()));
     };
 };
 
+const boost::ut::suite GraphInspectYamlTests_ = [] {
+    setCustomDefaultThreadPool();
+    using Scheduler = gr::scheduler::Simple<scheduler::ExecutionPolicy::multiThreaded>;
+
+    "kGraphInspect returns yaml when serialization_format is yaml"_test = [] {
+        using enum gr::message::Command;
+
+        gr::Graph              initGraph;
+        [[maybe_unused]] auto& source = initGraph.emplaceBlock<SlowSource<float>>({{"disconnect_on_done", false}});
+        [[maybe_unused]] auto& sink   = initGraph.emplaceBlock<CountingSink<float>>();
+
+        auto demo = createDemoSubScheduler<float>();
+        initGraph.addBlock(std::move(demo.scheduler));
+
+        Scheduler scheduler;
+        if (auto ret = scheduler.exchange(std::move(initGraph)); !ret) {
+            throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
+        }
+        const auto& graph = scheduler.graph();
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        auto schedulerThreadHandle = gr::test::thread_pool::executeScheduler("qa_GraphInspectYaml_managed", scheduler);
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler running";
+
+        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, graph.unique_name,     //
+            graph::property::kGraphInspect, property_map{{"serialization_format", "yaml"s}}, //
+            [](const Message& reply) {
+                if (reply.endpoint != graph::property::kGraphInspected) {
+                    return false;
+                }
+                const auto& data     = reply.data.value();
+                const auto  yamlData = data.find("yamlData");
+                expect(yamlData != data.cend()) << "yamlData key must be present";
+                if (yamlData != data.cend()) {
+                    const auto yamlStr = gr::test::get_value_or_fail<std::string>(yamlData->second);
+                    expect(!yamlStr.empty()) << "yamlData must not be empty";
+                    expect(yamlStr.find("ui_constraints") != std::string::npos);
+                }
+                return true;
+            });
+
+        scheduler.requestStop();
+        schedulerThreadHandle.get();
+        expect(scheduler.changeStateTo(lifecycle::State::INITIALISED).has_value());
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; }));
+    };
+};
+
+const boost::ut::suite SchedulerInspectTests_ = [] {
+    setCustomDefaultThreadPool();
+    using Scheduler = gr::scheduler::Simple<scheduler::ExecutionPolicy::multiThreaded>;
+
+    "kSchedulerInspect returns non-yaml graph structure"_test = [] {
+        using enum gr::message::Command;
+
+        gr::Graph              initGraph;
+        [[maybe_unused]] auto& source = initGraph.emplaceBlock<SlowSource<float>>({{"disconnect_on_done", false}});
+        [[maybe_unused]] auto& sink   = initGraph.emplaceBlock<CountingSink<float>>();
+
+        auto demo = createDemoSubScheduler<float>();
+        initGraph.addBlock(std::move(demo.scheduler));
+
+        Scheduler scheduler;
+        if (auto ret = scheduler.exchange(std::move(initGraph)); !ret) {
+            throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
+        }
+        const auto& graph = scheduler.graph();
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        auto schedulerThreadHandle = gr::test::thread_pool::executeScheduler("qa_SchedulerInspect_managed", scheduler);
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler running";
+
+        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, scheduler.unique_name, //
+            scheduler::property::kSchedulerInspect, property_map{},                          //
+            [&](const Message& reply) {
+                if (reply.endpoint != scheduler::property::kSchedulerInspected) {
+                    return false;
+                }
+                const auto& data     = reply.data.value();
+                const auto& children = gr::test::get_value_or_fail<property_map>(data.at("children"));
+                expect(eq(children.size(), 1UZ)) << "scheduler children should contain the graph";
+
+                const auto& graphData     = gr::test::get_value_or_fail<property_map>(children.at(std::pmr::string(graph.unique_name)));
+                const auto& graphChildren = gr::test::get_value_or_fail<property_map>(graphData.at("children"));
+                expect(eq(graphChildren.size(), 3UZ)) << "graph has source, sink, sub-scheduler";
+
+                const auto& graphEdges = gr::test::get_value_or_fail<property_map>(graphData.at("edges"));
+                expect(eq(graphEdges.size(), 0UZ)) << "no edges (not connected in this test)";
+                return true;
+            });
+
+        scheduler.requestStop();
+        schedulerThreadHandle.get();
+        expect(scheduler.changeStateTo(lifecycle::State::INITIALISED).has_value());
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; }));
+    };
+
+    "kSchedulerInspect returns yaml when serialization_format is yaml"_test = [] {
+        using enum gr::message::Command;
+
+        gr::Graph              initGraph;
+        [[maybe_unused]] auto& source = initGraph.emplaceBlock<SlowSource<float>>({{"disconnect_on_done", false}});
+        [[maybe_unused]] auto& sink   = initGraph.emplaceBlock<CountingSink<float>>();
+        auto                   demo   = createDemoSubScheduler<float>();
+        initGraph.addBlock(std::move(demo.scheduler));
+
+        Scheduler scheduler;
+        if (auto ret = scheduler.exchange(std::move(initGraph)); !ret) {
+            throw std::runtime_error(std::format("failed to initialize scheduler: {}", ret.error()));
+        }
+
+        gr::MsgPortOut toScheduler;
+        gr::MsgPortIn  fromScheduler;
+        expect(toScheduler.connect(scheduler.msgIn).has_value());
+        expect(scheduler.msgOut.connect(fromScheduler).has_value());
+
+        auto schedulerThreadHandle = gr::test::thread_pool::executeScheduler("qa_SchedulerInspectYaml_managed", scheduler);
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::RUNNING; })) << "scheduler running";
+
+        testing::sendAndWaitForReply<Set>(toScheduler, fromScheduler, scheduler.unique_name,         //
+            scheduler::property::kSchedulerInspect, property_map{{"serialization_format", "yaml"s}}, //
+            [](const Message& reply) {
+                if (reply.endpoint != scheduler::property::kSchedulerInspected) {
+                    return false;
+                }
+                const auto& data     = reply.data.value();
+                const auto  yamlData = data.find("yamlData");
+                expect(yamlData != data.cend()) << "yamlData key must be present";
+                if (yamlData != data.cend()) {
+                    const auto yamlStr = gr::test::get_value_or_fail<std::string>(yamlData->second);
+                    expect(!yamlStr.empty()) << "yamlData must not be empty";
+                    expect(yamlStr.find("ui_constraints") != std::string::npos);
+                }
+                return true;
+            });
+
+        scheduler.requestStop();
+        schedulerThreadHandle.get();
+        expect(scheduler.changeStateTo(lifecycle::State::INITIALISED).has_value());
+        expect(awaitCondition(scheduler, [&scheduler] { return scheduler.state() == lifecycle::State::INITIALISED; }));
+    };
+};
+
 } // namespace gr::subgraph_test
-int main() { /* tests are statically executed */ }
+int main() { return boost::ut::cfg<boost::ut::override>.run(); }

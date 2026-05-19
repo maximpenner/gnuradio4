@@ -118,10 +118,10 @@ struct BlockingSync {
     using TimePoint = std::chrono::time_point<ClockSourceType>;
 
 private:
-    TimePoint         _blockingSync_startTime{};
-    TimePoint         _blockingSync_lastUpdateTime{};
-    std::atomic<bool> _blockingSync_timerRunning{false};
-    std::atomic<bool> _blockingSync_timerDone{true};
+    TimePoint _blockingSync_startTime{};
+    TimePoint _blockingSync_lastUpdateTime{};
+    bool      _blockingSync_timerRunning{false};
+    bool      _blockingSync_timerDone{true};
 
     [[nodiscard]] constexpr Derived&       self() noexcept { return *static_cast<Derived*>(this); }
     [[nodiscard]] constexpr const Derived& self() const noexcept { return *static_cast<const Derived*>(this); }
@@ -260,22 +260,28 @@ public:
      */
     void blockingSyncStop() { stopTimer(); }
 
+    ~BlockingSync() { stopTimer(); }
+
 private:
     void startTimer() {
-        if (_blockingSync_timerRunning.exchange(true)) {
+        if (gr::atomic_ref(_blockingSync_timerRunning).exchange(true)) {
             return;
         }
 
-        _blockingSync_timerDone = false;
+        gr::atomic_ref(_blockingSync_timerDone).store_release(false);
         thread_pool::Manager::defaultIoPool()->execute([this]() {
             thread_pool::thread::setThreadName(std::format("sync:{}", self().name.value));
 
             TimePoint nextWakeUp = ClockSourceType::now();
 
-            while (getSampleRate() > 0.f && lifecycle::isActive(self().state())) {
+            while (gr::atomic_ref(_blockingSync_timerRunning).load_acquire() && getSampleRate() > 0.f && lifecycle::isActive(self().state())) {
                 const auto period = getChunkPeriod();
                 nextWakeUp += period;
                 std::this_thread::sleep_until(nextWakeUp);
+
+                if (!gr::atomic_ref(_blockingSync_timerRunning).load_acquire()) {
+                    break; // stop requested — exit without touching self()
+                }
 
                 if (self().state() == lifecycle::State::PAUSED) {
                     _blockingSync_lastUpdateTime = ClockSourceType::now();
@@ -286,17 +292,14 @@ private:
                 self().progress->notify_all();
             }
 
-            _blockingSync_timerRunning = false;
-            _blockingSync_timerDone    = true;
-            _blockingSync_timerDone.notify_all();
+            gr::atomic_ref(_blockingSync_timerDone).store_release(true);
+            gr::atomic_ref(_blockingSync_timerDone).notify_all();
         });
     }
 
     void stopTimer() {
-        if (!_blockingSync_timerRunning.exchange(false)) {
-            return;
-        }
-        _blockingSync_timerDone.wait(false);
+        gr::atomic_ref(_blockingSync_timerRunning).store_release(false);
+        gr::atomic_ref(_blockingSync_timerDone).wait(false);
     }
 };
 

@@ -67,14 +67,12 @@ const boost::ut::suite TagTests = [] {
 
         auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_ONE>>({{"name", "SampleGeneratorSink"}});
 
-        // connect UI sink -- doesn't strictly need to be part of the graph due to BlockingIO<false> definition
-        // but the present 'connect' API assumes it to be part of the Graph
         auto& uiSink = testGraph.emplaceBlock<testing::ImChartMonitor<float>>({{"name", "BasicImChartSink"}});
         expect(uiSink.meta_information.value.contains("Drawable")) << "drawable";
 
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"clk_in">(funcGen)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(sink)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(uiSink)));
+        expect(testGraph.connect<"out", "clk_in">(clockSrc, funcGen).has_value());
+        expect(testGraph.connect<"out", "in">(funcGen, sink).has_value());
+        expect(testGraph.connect<"out", "in">(funcGen, uiSink).has_value());
 
         scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(testGraph)); !ret) {
@@ -110,8 +108,8 @@ const boost::ut::suite TagTests = [] {
 
         auto& uiSink = testGraph.emplaceBlock<testing::ImChartMonitor<float, false>>({{"reset_view", true}, {"plot_graph", true}, {"plot_timing", true}, {"timeout_ms", static_cast<gr::Size_t>(400)}});
 
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(clockSrc).to<"clk_in">(funcGen)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(funcGen).to<"in">(uiSink)));
+        expect(testGraph.connect<"out", "clk_in">(clockSrc, funcGen).has_value());
+        expect(testGraph.connect<"out", "in">(funcGen, uiSink).has_value());
 
         scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(testGraph)); !ret) {

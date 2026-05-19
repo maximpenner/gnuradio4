@@ -435,7 +435,7 @@ public:
         updateThreadConstraints();
     }
 
-    template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = std::invoke_result_t<Callable, Args...>>
+    template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = gr::meta::invoke_result_t<Callable, Args...>>
     requires(std::is_same_v<R, void>)
     void execute(Callable&& func, Args&&... args, const std::source_location& location = std::source_location::current()) {
         static thread_local gr::SpinWait spinWait;
@@ -462,7 +462,7 @@ public:
         spinWait.reset();
     }
 
-    template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = std::invoke_result_t<Callable, Args...>>
+    template<const detail::basic_fixed_string taskName = "", uint32_t priority = 0, int32_t cpuID = -1, std::invocable Callable, typename... Args, typename R = gr::meta::invoke_result_t<Callable, Args...>>
     requires(!std::is_same_v<R, void>)
     [[nodiscard]] std::future<R> execute(Callable&& func, Args&&... funcArgs) {
         if constexpr (cpuID >= 0) {
@@ -499,8 +499,6 @@ private:
 
     void updateThreadConstraints() {
         std::scoped_lock lock(_threadListMutex);
-        // std::erase_if(_threads, [](auto &thread) { return !thread.joinable(); });
-
         std::for_each(_threads.begin(), _threads.end(), [this, threadID = std::size_t{0}](auto& thread) mutable { this->updateThreadConstraints(threadID++, thread); });
     }
 
@@ -521,11 +519,14 @@ private:
         if (globalAffinityMask.empty()) {
             return {};
         }
+        // pools with minThreads == 0 (e.g. the Emscripten CPU pool, lazily spawned) would divide
+        // by zero below; fall back to a single-stripe layout until the pool actually grows.
+        const std::size_t stripe = std::max<std::size_t>(minThreads(), 1UZ);
         std::vector<bool> affinityMask;
         std::size_t       coreCount = 0;
         for (bool value : globalAffinityMask) {
             if (value) {
-                affinityMask.push_back(coreCount++ % minThreads() == threadID);
+                affinityMask.push_back(coreCount++ % stripe == threadID);
             } else {
                 affinityMask.push_back(false);
             }
@@ -538,11 +539,22 @@ private:
         _globalThreadCount.fetch_add(1UZ, std::memory_order_relaxed);
         const std::size_t nTotalThreads = getTotalThreadCount();
         if (nTotalThreads + 1UZ >= thread::getThreadLimit()) {
+            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
             throw std::out_of_range(std::format("pool({}): about to exhaust global thread limit: {} out of {} : at {}", poolName(), nTotalThreads, thread::getThreadLimit(), location));
         }
-        const std::size_t nThreads = numThreads();
-        std::thread&      thread   = _threads.emplace_back(&BasicThreadPool::worker, this);
-        updateThreadConstraints(nThreads + 1UZ, thread);
+        const std::size_t threadIdx = _numThreads.fetch_add(1UZ, std::memory_order_acq_rel);
+        try {
+            std::thread& thread = _threads.emplace_back(&BasicThreadPool::worker, this, threadIdx);
+            updateThreadConstraints(threadIdx + 1UZ, thread);
+        } catch (...) {
+            _numThreads.fetch_sub(1UZ, std::memory_order_acq_rel);
+            _globalThreadCount.fetch_sub(1UZ, std::memory_order_relaxed);
+            throw;
+        }
+        if (numThreads() >= minThreads()) {
+            std::atomic_store_explicit(&_initialised, true, std::memory_order_release);
+            _initialised.notify_all();
+        }
     }
 
     template<typename F, typename... A>
@@ -588,20 +600,15 @@ private:
         return result;
     }
 
-    void worker() {
+    void worker(std::size_t threadID) {
         constexpr uint32_t N_SPIN       = 1 << 8;
         uint32_t           noop_counter = 0;
-        const auto         threadID     = _numThreads.fetch_add(1UZ, std::memory_order_relaxed);
-        std::mutex         mutex;
-        std::unique_lock   lock(mutex);
-        auto               lastUsed              = std::chrono::steady_clock::now();
-        auto               timeDiffSinceLastUsed = std::chrono::steady_clock::now() - lastUsed;
-        if (numThreads() >= minThreads()) {
-            std::atomic_store_explicit(&_initialised, true, std::memory_order_release);
-            _initialised.notify_all();
-        }
-        _numThreads.notify_one();
-        bool running = true;
+        // _numThreads incremented in createWorkerThread()
+        std::mutex       mutex;
+        std::unique_lock lock(mutex);
+        auto             lastUsed              = std::chrono::steady_clock::now();
+        auto             timeDiffSinceLastUsed = std::chrono::steady_clock::now() - lastUsed;
+        bool             running               = true;
         do {
             if (TaskQueue::TaskContainer currentTaskContainer = popTask(); !currentTaskContainer.empty()) {
                 assert(!currentTaskContainer.empty());

@@ -10,14 +10,6 @@
 #include <gnuradio-4.0/Value.hpp>
 #include <gnuradio-4.0/formatter/ValueFormatter.hpp>
 
-#ifdef __cpp_lib_hardware_interference_size
-using std::hardware_constructive_interference_size;
-using std::hardware_destructive_interference_size;
-#else
-inline constexpr std::size_t hardware_destructive_interference_size  = 64;
-inline constexpr std::size_t hardware_constructive_interference_size = 64;
-#endif
-
 #ifdef __EMSCRIPTEN__
 // constexpr for cases where emscripten does not yet support constexpr and has to fall back to static const or nothing
 #define EM_CONSTEXPR
@@ -79,7 +71,7 @@ concept PropertyMapType = std::same_as<std::decay_t<T>, property_map>;
  * may choose to chunk the data based on the MIN_SAMPLES/MAX_SAMPLES criteria only, or in addition break-up the stream
  * so that there is only one tag per scheduler iteration. Multiple tags on the same sample shall be merged to one.
  */
-struct alignas(hardware_constructive_interference_size) Tag {
+struct alignas(kCacheLine) Tag {
     std::size_t  index{0UZ};
     property_map map{};
 
@@ -204,11 +196,14 @@ namespace tag { // definition of default tags and names
 inline EM_CONSTEXPR_STATIC DefaultTag<"sample_rate", float, "Hz", "signal sample rate"> SAMPLE_RATE;
 inline EM_CONSTEXPR_STATIC DefaultTag<"sample_rate", float, "Hz", "signal sample rate"> SIGNAL_RATE;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_name", std::string, "", "signal name"> SIGNAL_NAME;
+inline EM_CONSTEXPR_STATIC DefaultTag<"num_channels", gr::Size_t, "", "interleaved channel count"> NUM_CHANNELS;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_quantity", std::string, "", "signal quantity"> SIGNAL_QUANTITY;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_unit", std::string, "", "signal's physical SI unit"> SIGNAL_UNIT;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_min", float, "a.u.", "signal physical max. (e.g. DAQ) limit"> SIGNAL_MIN;
 inline EM_CONSTEXPR_STATIC DefaultTag<"signal_max", float, "a.u.", "signal physical max. (e.g. DAQ) limit"> SIGNAL_MAX;
 inline EM_CONSTEXPR_STATIC DefaultTag<"n_dropped_samples", gr::Size_t, "", "number of dropped samples"> N_DROPPED_SAMPLES;
+inline EM_CONSTEXPR_STATIC DefaultTag<"frequency", double, "Hz", "signal center frequency"> FREQUENCY;
+inline EM_CONSTEXPR_STATIC DefaultTag<"rx_overflow", bool, "", "RX overflow indicator"> RX_OVERFLOW;
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_name", std::string> TRIGGER_NAME;
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_time", uint64_t, "ns", "UTC-based time-stamp"> TRIGGER_TIME;
 inline EM_CONSTEXPR_STATIC DefaultTag<"trigger_offset", float, "s", "sample delay w.r.t. the trigger (e.g.compensating analog group delays)"> TRIGGER_OFFSET;
@@ -220,7 +215,19 @@ inline EM_CONSTEXPR_STATIC DefaultTag<"reset_default", bool, "", "reset block st
 inline EM_CONSTEXPR_STATIC DefaultTag<"store_default", bool, "", "store block settings as default"> STORE_DEFAULTS;
 inline EM_CONSTEXPR_STATIC DefaultTag<"end_of_stream", bool, "", "end of stream, receiver should change to DONE state"> END_OF_STREAM;
 
-inline constexpr std::array<std::string_view, 16> kDefaultTags = {"sample_rate", "signal_name", "signal_quantity", "signal_unit", "signal_min", "signal_max", "n_dropped_samples", "trigger_name", "trigger_time", "trigger_offset", "trigger_meta_info", "context", "time", "reset_default", "store_default", "end_of_stream"};
+inline constexpr std::array<std::string_view, 19> kDefaultTags = {"sample_rate", "frequency", "signal_name", "num_channels", "signal_quantity", "signal_unit", "signal_min", "signal_max", "n_dropped_samples", "rx_overflow", "trigger_name", "trigger_time", "trigger_offset", "trigger_meta_info", "context", "time", "reset_default", "store_default", "end_of_stream"};
+
+template<typename T>
+inline void put(property_map& map, std::string_view key, T&& value) {
+    auto* res                       = map.get_allocator().resource();
+    map[std::pmr::string(key, res)] = pmt::Value(std::forward<T>(value), res);
+}
+
+template<typename T, fixed_string Key, typename PMT_TYPE, fixed_string Unit, fixed_string Description>
+inline void put(property_map& map, const DefaultTag<Key, PMT_TYPE, Unit, Description>& /*tag*/, T&& value) {
+    auto* res                       = map.get_allocator().resource();
+    map[std::pmr::string(Key, res)] = pmt::Value(std::forward<T>(value), res);
+}
 
 } // namespace tag
 

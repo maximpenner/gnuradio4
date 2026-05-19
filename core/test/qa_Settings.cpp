@@ -6,6 +6,7 @@
 #include <gnuradio-4.0/meta/formatter.hpp>
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/BlockMerging.hpp>
 #include <gnuradio-4.0/Buffer.hpp>
 #include <gnuradio-4.0/Graph.hpp>
 #include <gnuradio-4.0/Graph_yaml_importer.hpp>
@@ -134,12 +135,12 @@ const boost::ut::suite SettingsTests = [] {
 
         auto& block1 = testGraph.emplaceBlock<SettingsChangeRecorder<float>>({{"name", "SettingsChangeRecorder#1"}});
         auto& block2 = testGraph.emplaceBlock<SettingsChangeRecorder<float>>({{"name", "SettingsChangeRecorder#2"}});
-        expect(eq(block1.settings().defaultParameters().size(), 16UZ));
+        expect(eq(block1.settings().defaultParameters().size(), 18UZ));
         expect(eq(block1.settings().getNStoredParameters(), 1UZ));
-        expect(eq(block1.settings().getStored().value().size(), 16UZ));
+        expect(eq(block1.settings().getStored().value().size(), 18UZ));
         expect(eq(block1.name, "SettingsChangeRecorder#1"s));
         expect(eq(block1.settings().getNAutoUpdateParameters(), 1UZ));
-        expect(eq(block1.settings().autoUpdateParameters().size(), 11UL));
+        expect(eq(block1.settings().autoUpdateParameters().size(), 13UL));
         expect(eq(block1.settings().autoForwardParameters().size(), gr::tag::kDefaultTags.size()));
 
         auto& sink = testGraph.emplaceBlock<Sink<float>>();
@@ -159,7 +160,7 @@ const boost::ut::suite SettingsTests = [] {
         expect(eq(sink.settings().autoForwardParameters().size(), gr::tag::kDefaultTags.size() + 1UZ)); // + n_samples_max
 
         block1.context = "Test Context";
-        expect(eq(block1.settings().activeParameters().size(), 16UL));
+        expect(eq(block1.settings().activeParameters().size(), 18UL));
         expect(block1.settings().get(gr::tag::CONTEXT.shortKey()).has_value());
         expect(block1.settings().get({gr::tag::CONTEXT.shortKey()}).has_value());
         expect(not block1.settings().get({"test"}).has_value());
@@ -173,7 +174,7 @@ const boost::ut::suite SettingsTests = [] {
         expect(block1.settings().get(keys1).empty());
         expect(block1.settings().get(keys2).empty());
         expect(block1.settings().get(keys3).empty());
-        expect(eq(block1.settings().get().size(), 16UL));
+        expect(eq(block1.settings().get().size(), 18UL));
 
         // set non-existent setting
         expect(eq(block1.settings().getNStoredParameters(), 1UZ));
@@ -195,9 +196,9 @@ const boost::ut::suite SettingsTests = [] {
         block1.settings().updateActiveParameters();
 
         // src -> block1 -> block2 -> sink
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(src).to<"in">(block1)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(block1).to<"in">(block2)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(block2).to<"in">(sink)));
+        expect(testGraph.connect<"out", "in">(src, block1).has_value());
+        expect(testGraph.connect<"out", "in">(block1, block2).has_value());
+        expect(testGraph.connect<"out", "in">(block2, sink).has_value());
 
         expect(!src.settings().autoUpdateParameters().contains(gr::tag::SAMPLE_RATE.shortKey())) << "manual setting disable auto-update";
         expect(eq(src.settings().getNStoredParameters(), 1UZ));
@@ -205,9 +206,9 @@ const boost::ut::suite SettingsTests = [] {
         expect(src.settings().set({{gr::tag::SAMPLE_RATE.shortKey(), 49000.0f}}).empty()) << "successful set returns empty map";
         expect(eq(src.settings().getNStoredParameters(), 1UZ));     // old parameters are removed from stored
         expect(eq(src.settings().getNAutoUpdateParameters(), 1UZ)); // old parameters are removed from autoUpdate
-        expect(eq(src.settings().stagedParameters().size(), 0UZ));
-        expect(src.settings().activateContext() != std::nullopt);  // activateContext() fills staged parameters
-        expect(eq(src.settings().stagedParameters().size(), 2UZ)); // "n_samples_max", sample_rate
+        // staged params may contain re-staged forward params from init(); activateContext() adds more
+        expect(src.settings().activateContext() != std::nullopt); // activateContext() fills staged parameters
+        expect(ge(src.settings().stagedParameters().size(), 2UZ)) << "at least n_samples_max + sample_rate";
 
         gr::scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(testGraph)); !ret) {
@@ -268,10 +269,10 @@ const boost::ut::suite SettingsTests = [] {
             block.init(block.progress); // N.B. self-assign existing progress and thread-pool (just for unit-tests)
             expect(eq(block.settings().getNStoredParameters(), 1UZ));
             expect(eq(block.settings().getNAutoUpdateParameters(), 1UZ));
-            expect(eq(block.settings().autoUpdateParameters().size(), 12UL));
+            expect(eq(block.settings().autoUpdateParameters().size(), 14UL));
             expect(block.settings().activateContext() != std::nullopt);
             expect(eq(block.settings().stagedParameters().size(), 0UZ)); // same activeCtx, no changes
-            expect(eq(block.settings().get().size(), 16UL));             // all active settings
+            expect(eq(block.settings().get().size(), 18UL));             // all active settings
             expect(eq(gr::test::get_value_or_fail<float>(*block.settings().get("scaling_factor")), 1.f));
         };
 
@@ -285,12 +286,12 @@ const boost::ut::suite SettingsTests = [] {
             block.init(block.progress); // N.B. self-assign existing progress and thread-pool (just for unit-tests)
             expect(eq(block.settings().getNStoredParameters(), 1UZ));
             expect(eq(block.settings().getNAutoUpdateParameters(), 1UZ));
-            expect(eq(block.settings().autoUpdateParameters().size(), 10UL)); // no "scaling_factor"
+            expect(eq(block.settings().autoUpdateParameters().size(), 12UL)); // no "scaling_factor", no "test_enum_setting"
             expect(eq(block.settings().autoUpdateParameters().contains("scaling_factor"), false));
             expect(block.settings().activateContext() != std::nullopt);
             expect(eq(block.settings().stagedParameters().size(), 0UZ)); // same activeCtx, no changes
             block.settings().updateActiveParameters();
-            expect(eq(block.settings().get().size(), 16UL));
+            expect(eq(block.settings().get().size(), 18UL));
             expect(eq(block.scaling_factor, 2.f));
             expect(eq(gr::test::get_value_or_fail<float>(*block.settings().get("scaling_factor")), 2.f));
         };
@@ -301,11 +302,13 @@ const boost::ut::suite SettingsTests = [] {
             expect(eq(block.settings().getNStoredParameters(), 1UZ));              // store default parameters
             expect(eq(block.settings().getNAutoUpdateParameters(), 1UZ));
             expect(eq(block.settings().stagedParameters().size(), 0UZ));
-            expect(eq(block.settings().autoUpdateParameters().size(), 12UL)); // all isWritable settings (enable reflections)
+            expect(eq(block.settings().autoUpdateParameters().size(), 14UL)); // all isWritable settings (enable reflections)
             expect(eq(block.settings().autoForwardParameters().size(), gr::tag::kDefaultTags.size()));
-            expect(eq(block.settings().get().size(), 16UL));
+            expect(eq(block.settings().get().size(), 18UL));
             expect(eq(block.scaling_factor, 1.f));
             expect(eq(gr::test::get_value_or_fail<float>(*block.settings().get("scaling_factor")), 1.f));
+            expect(eq(gr::test::get_value_or_fail<std::vector<std::string>>(block.meta_information.value.at("test_enum_setting::enum_values")), std::vector<std::string>{"TEST_STATE1", "TEST_STATE2", "TEST_STATE3"}));
+            expect(eq(gr::test::get_value_or_fail<std::vector<std::string>>(block.meta_information.value.at("annotated_test_enum_setting::enum_values")), std::vector<std::string>{"TEST_STATE1", "TEST_STATE2", "TEST_STATE3"}));
         };
 
         "with init parameter via graph"_test = [] {
@@ -314,9 +317,9 @@ const boost::ut::suite SettingsTests = [] {
             expect(eq(block.settings().getNStoredParameters(), 1UZ)); // store default parameters
             expect(eq(block.settings().getNAutoUpdateParameters(), 1UZ));
             expect(eq(block.settings().stagedParameters().size(), 0UZ));
-            expect(eq(block.settings().autoUpdateParameters().size(), 11UL)); // "scaling_factor" removed from auto updates
+            expect(eq(block.settings().autoUpdateParameters().size(), 13UL)); // "scaling_factor" removed from auto updates
             expect(eq(block.settings().autoForwardParameters().size(), gr::tag::kDefaultTags.size()));
-            expect(eq(block.settings().get().size(), 16UL));
+            expect(eq(block.settings().get().size(), 18UL));
             expect(eq(block.scaling_factor, 2.f));
             expect(eq(gr::test::get_value_or_fail<float>(*block.settings().get("scaling_factor")), 2.f));
         };
@@ -328,9 +331,9 @@ const boost::ut::suite SettingsTests = [] {
         expect(eq(block.settings().getNStoredParameters(), 1UZ)); // store default parameters
         expect(eq(block.settings().stagedParameters().size(), 0UZ));
         block.settings().updateActiveParameters();
-        expect(eq(block.settings().get().size(), 16UL));
+        expect(eq(block.settings().get().size(), 18UL));
         block._debug   = true;
-        const auto val = block.settings().set({{"vector_setting", Tensor{42.f, 2.f, 3.f}}, {"string_vector_setting", Tensor<gr::pmt::Value>{"A", "B", "C"}}});
+        const auto val = block.settings().set({{"vector_setting", std::vector{42.f, 2.f, 3.f}}, {"string_vector_setting", std::vector<std::string>{"A", "B", "C"}}});
         expect(val.empty()) << "unable to stage settings";
         expect(eq(block.settings().getNStoredParameters(), 1UZ)); // new parameters added, but old parameters removed
         expect(eq(block.settings().stagedParameters().size(), 0UZ));
@@ -345,6 +348,50 @@ const boost::ut::suite SettingsTests = [] {
         expect(eq(gr::test::get_value_or_fail<std::vector<std::string>>(*block.settings().get("string_vector_setting")), std::vector<std::string>{"A", "B", "C"}));
     };
 
+    "vector<string> setting round-trip"_test = [] {
+        Graph testGraph;
+        auto& block  = testGraph.emplaceBlock<SettingsChangeRecorder<float>>();
+        block._debug = false;
+
+        // tests std::vector<std::string> → pmt::Value → std::vector<std::string> round-trip
+        const auto val = block.settings().set({{"string_vector_setting", std::vector<std::string>{"hello", "world", "!"}}});
+        expect(val.empty()) << "unable to stage string_vector_setting";
+        expect(block.settings().activateContext() != std::nullopt);
+        expect(eq(block.settings().applyStagedParameters().forwardParameters.size(), 0UZ));
+
+        expect(eq(block.string_vector_setting.value, std::vector<std::string>{"hello", "world", "!"}));
+
+        // round-trip through get()
+        expect(eq(gr::test::get_value_or_fail<std::vector<std::string>>(*block.settings().get("string_vector_setting")), std::vector<std::string>{"hello", "world", "!"}));
+    };
+
+    "array-type support"_test = [] {
+        Graph testGraph;
+        auto& block  = testGraph.emplaceBlock<SettingsChangeRecorder<float>>();
+        block._debug = true;
+
+        const auto val = block.settings().set({{"array_setting", std::array{42.f, 2.f, 3.f}}, {"string_array_setting", std::array<std::string, 3>{"X", "Y", "Z"}}});
+        expect(val.empty()) << "unable to stage array settings";
+        expect(block.settings().activateContext() != std::nullopt);
+        expect(eq(block.settings().stagedParameters().size(), 2UZ));
+        expect(eq(block.settings().applyStagedParameters().forwardParameters.size(), 0UZ));
+
+        expect(eq(block.array_setting, std::array{42.f, 2.f, 3.f}));
+        expect(eq(block.string_array_setting, std::array<std::string, 3>{"X", "Y", "Z"}));
+        expect(eq(block._updateCount, 1)) << std::format("actual update count: {}\n", block._updateCount);
+
+        // round-trip through get()
+        expect(eq(gr::test::get_value_or_fail<std::array<float, 3>>(*block.settings().get("array_setting")), std::array{42.f, 2.f, 3.f}));
+        expect(eq(gr::test::get_value_or_fail<std::array<std::string, 3>>(*block.settings().get("string_array_setting")), std::array<std::string, 3>{"X", "Y", "Z"}));
+    };
+
+    "array-type size mismatch"_test = [] {
+        Graph testGraph;
+        auto& block = testGraph.emplaceBlock<SettingsChangeRecorder<float>>();
+        // array_setting expects size 3, provide size 2 — should throw
+        expect(throws([&] { std::ignore = block.settings().set({{"array_setting", std::vector{42.f, 2.f}}}); })) << "should reject size-mismatched collection";
+    };
+
     "unique ID"_test = [] {
         Graph       testGraph;
         const auto& block1 = testGraph.emplaceBlock<SettingsChangeRecorder<float>>();
@@ -352,8 +399,8 @@ const boost::ut::suite SettingsTests = [] {
         expect(not eq(block1.unique_id, block2.unique_id)) << "unique per-type block id (size_t)";
         expect(not eq(block1.unique_name, block2.unique_name)) << "unique per-type block id (string)";
 
-        auto merged1 = merge<"out", "in">(SettingsChangeRecorder<float>(), SettingsChangeRecorder<float>());
-        auto merged2 = merge<"out", "in">(SettingsChangeRecorder<float>(), SettingsChangeRecorder<float>());
+        auto merged1 = Merge<SettingsChangeRecorder<float>, "out", SettingsChangeRecorder<float>, "in">();
+        auto merged2 = Merge<SettingsChangeRecorder<float>, "out", SettingsChangeRecorder<float>, "in">();
         expect(not eq(merged1.unique_id, merged2.unique_id)) << "unique per-type block id (size_t) ";
         expect(not eq(merged1.unique_name, merged2.unique_name)) << "unique per-type block id (string) ";
     };
@@ -411,9 +458,9 @@ const boost::ut::suite SettingsTests = [] {
         expect(eq(block2.input_chunk_size, std::size_t(5)));
 
         // src -> block1 -> block2 -> sink
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(src).to<"in">(block1)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(block1).to<"in">(block2)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(block2).to<"in">(sink)));
+        expect(testGraph.connect<"out", "in">(src, block1).has_value());
+        expect(testGraph.connect<"out", "in">(block1, block2).has_value());
+        expect(testGraph.connect<"out", "in">(block2, sink).has_value());
 
         gr::scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(testGraph)); !ret) {
@@ -445,7 +492,7 @@ const boost::ut::suite SettingsTests = [] {
         expect(eq(block.name, "TestNameAlt"s));
         expect(eq(block.scaling_factor, 42.f));
         expect(not block._resetCalled);
-        expect(eq(block.settings().defaultParameters().size(), 16UZ));
+        expect(eq(block.settings().defaultParameters().size(), 18UZ));
         block.settings().resetDefaults();
         expect(eq(block.settings().getNStoredParameters(), 1UZ));
         expect(block._resetCalled);
@@ -462,12 +509,12 @@ const boost::ut::suite SettingsTests = [] {
 
         // test storeDefaults()
         const auto defaultParOld = block.settings().defaultParameters();
-        expect(eq(defaultParOld.size(), 16UZ));
+        expect(eq(defaultParOld.size(), 18UZ));
         expect(eq(defaultParOld.at("name").value_or(std::string()), "TestName"s));
         expect(eq(gr::test::get_value_or_fail<float>(defaultParOld.at("scaling_factor")), 2.f));
         block.settings().storeDefaults();
         const auto defaultParNew = block.settings().defaultParameters();
-        expect(eq(defaultParNew.size(), 16UZ));
+        expect(eq(defaultParNew.size(), 18UZ));
         expect(eq(defaultParNew.at("name").value_or(std::string()), "TestNameAlt"s));
         expect(eq(gr::test::get_value_or_fail<float>(defaultParNew.at("scaling_factor")), 42.f));
         expect(block.settings().set({{"name", "TestNameAlt2"}, {"scaling_factor", 43.f}}).empty()) << "successful set returns empty map\n";
@@ -834,10 +881,10 @@ const boost::ut::suite CtxSettingsTests = [] {
 
         //                                  -> sinkOne
         // src -> monitorBulk -> monitorOne -> sinkBulk
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(src).to<"in">(monitorBulk)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(monitorBulk).to<"in">(monitorOne)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(monitorOne).to<"in">(sinkBulk)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.connect<"out">(monitorOne).to<"in">(sinkOne)));
+        expect(testGraph.connect<"out", "in">(src, monitorBulk).has_value());
+        expect(testGraph.connect<"out", "in">(monitorBulk, monitorOne).has_value());
+        expect(testGraph.connect<"out", "in">(monitorOne, sinkBulk).has_value());
+        expect(testGraph.connect<"out", "in">(monitorOne, sinkOne).has_value());
 
         gr::scheduler::Simple sched;
         if (auto ret = sched.exchange(std::move(testGraph)); !ret) {
@@ -957,6 +1004,125 @@ connections:
         }
     };
 #endif
+};
+
+namespace gr::pmr_test {
+
+template<typename T>
+struct PmrSettingsBlock : gr::Block<PmrSettingsBlock<T>> {
+    using Description = gr::Doc<"block with std::pmr:: settings fields">;
+    gr::PortIn<T>  in;
+    gr::PortOut<T> out;
+
+    gr::Annotated<std::pmr::string, "signal name">         signal_name;
+    gr::Annotated<std::pmr::vector<float>, "coefficients"> coefficients;
+    gr::Annotated<std::string, "label">                    label   = "default";
+    gr::Annotated<std::vector<float>, "weights">           weights = std::vector<float>{1.f, 2.f};
+
+    GR_MAKE_REFLECTABLE(PmrSettingsBlock, in, out, signal_name, coefficients, label, weights);
+
+    [[nodiscard]] constexpr T processOne(T x) const noexcept { return x; }
+};
+
+} // namespace gr::pmr_test
+
+const boost::ut::suite<"PMR settings"> _pmrSettings = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+    using namespace std::string_literals;
+
+    "pmr::string block setting round-trips through property_map"_test = [] {
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& blk  = testGraph.emplaceBlock<pmr_test::PmrSettingsBlock<float>>({{"signal_name", "test_signal"}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        expect(testGraph.connect<"out", "in">(src, blk).has_value());
+        expect(testGraph.connect<"out", "in">(blk, sink).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        expect(eq(std::string_view(blk.signal_name), "test_signal"sv)) << "pmr::string field must be set from property_map";
+    };
+
+    "pmr::vector<float> block setting round-trips"_test = [] {
+        pmr_test::PmrSettingsBlock<float> blk;
+        blk.init(std::make_shared<gr::Sequence>());
+
+        Tensor<float> t(extents_from, {3UZ});
+        t[0] = 1.f;
+        t[1] = 2.f;
+        t[2] = 3.f;
+
+        property_map params;
+        params["coefficients"] = std::move(t);
+        expect(blk.settings().setStaged(params).empty()) << "setStaged() must succeed";
+        std::ignore = blk.settings().applyStagedParameters();
+
+        expect(eq(blk.coefficients.value.size(), 3UZ)) << "pmr::vector must have 3 elements";
+        expect(eq(blk.coefficients.value[0], 1.f));
+        expect(eq(blk.coefficients.value[2], 3.f));
+
+        auto stored = blk.settings().get();
+        expect(stored.contains("coefficients")) << "pmr::vector field in get()";
+    };
+
+    "std::string block setting backward compatibility"_test = [] {
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& blk  = testGraph.emplaceBlock<pmr_test::PmrSettingsBlock<float>>({{"label", "hello"}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        expect(testGraph.connect<"out", "in">(src, blk).has_value());
+        expect(testGraph.connect<"out", "in">(blk, sink).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        expect(eq(std::string_view(blk.label), "hello"sv)) << "std::string field must still work";
+    };
+
+    "settings get() returns both pmr and non-pmr fields"_test = [] {
+        pmr_test::PmrSettingsBlock<float> blk;
+        blk.init(std::make_shared<gr::Sequence>());
+
+        property_map params;
+        params["signal_name"] = std::pmr::string("from_map");
+        params["label"]       = std::string("also_set");
+        expect(blk.settings().set(params).empty());
+        std::ignore = blk.settings().applyStagedParameters();
+
+        auto allSettings = blk.settings().get();
+        expect(allSettings.contains("signal_name")) << "pmr::string field must appear in get()";
+        expect(allSettings.contains("label")) << "std::string field must appear in get()";
+    };
+
+    "rebindFieldsTo migrates pmr fields to new resource"_test = [] {
+        std::array<std::byte, 65536>        buf{};
+        std::pmr::monotonic_buffer_resource targetMr(buf.data(), buf.size());
+
+        pmr_test::PmrSettingsBlock<float> blk;
+        blk.init(std::make_shared<gr::Sequence>());
+
+        blk.signal_name.value  = std::pmr::string("test_signal");
+        blk.coefficients.value = std::pmr::vector<float>{1.f, 2.f, 3.f};
+
+        expect(blk.signal_name.value.get_allocator().resource() == std::pmr::get_default_resource());
+        expect(blk.coefficients.value.get_allocator().resource() == std::pmr::get_default_resource());
+
+        blk.rebindFieldsTo(&targetMr);
+
+        expect(blk.resource() == &targetMr) << "block resource must be rebound";
+        expect(blk.signal_name.value.get_allocator().resource() == &targetMr) << "pmr::string field must be rebound";
+        expect(blk.coefficients.value.get_allocator().resource() == &targetMr) << "pmr::vector field must be rebound";
+        expect(eq(std::string_view(blk.signal_name), "test_signal"sv)) << "data preserved after rebind";
+        expect(eq(blk.coefficients.value.size(), 3UZ)) << "vector size preserved";
+        expect(eq(blk.coefficients.value[2], 3.f)) << "vector data preserved";
+    };
 };
 
 int main() { /* tests are statically executed */ }

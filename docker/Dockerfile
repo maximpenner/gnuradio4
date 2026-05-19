@@ -18,14 +18,14 @@ ENV JAVA_HOME=/opt/java/openjdk \
     LC_ALL=en_US.UTF-8 \
     CMAKE_MAKE_PROGRAM=ninja \
     EMSDK_HOME=/opt/emsdk \
-    EMSDK_VERSION=4.0.8
+    EMSDK_VERSION=5.0.2
 
 # Install compilers, package managers and build-tools
 # As we are using the the ubuntu prerelease llvm and cmake are fresh enough, readd these if the version is not sufficient anymore
 # && wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && add-apt-repository 'deb http://apt.llvm.org/mantic/ llvm-toolchain-mantic-18 main'
 # && wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null && echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' | tee -a /etc/apt/sources.list.d/kitware.list >/dev/null
 RUN apt-get update -y \
-    && apt-get install --no-install-recommends -qqy wget gpg ca-certificates software-properties-common bash file locales python3-pip npm sudo cmake git make ninja-build clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev libclang-20-dev libclang-rt-20-dev libomp-20-dev llvm-20-dev lld-20 gdb lldb-20 gcc-14 g++-14 gcc-15 g++-15 ccache mold libcurl4-openssl-dev libngtcp2-dev libnghttp2-dev libnghttp3-dev libonnxruntime-dev libonnxruntime1.21 libonnxruntime-providers onnxruntime-tools \
+    && apt-get install --no-install-recommends -qqy wget gpg ca-certificates software-properties-common bash file locales python3-pip npm sudo cmake git make ninja-build clang-20 clang-tools-20 libc++-20-dev libc++abi-20-dev libclang-20-dev libclang-rt-20-dev libomp-20-dev llvm-20-dev lld-20 gdb lldb-20 gcc-14 g++-14 gcc-15 g++-15 ccache mold libcurl4-openssl-dev libngtcp2-dev libnghttp2-dev libnghttp3-dev libonnxruntime-dev libonnxruntime1.21 libonnxruntime-providers onnxruntime-tools libegl1-mesa-dev libgl-dev \
     && locale-gen en_US.UTF-8 && echo 'LANG="en_US.UTF-8"'>/etc/default/locale \
     && useradd -m -g users user \
     && echo user ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/user && chmod 0440 /etc/sudoers.d/user \
@@ -64,6 +64,7 @@ RUN apt-get update -y \
     && ./emsdk install $EMSDK_VERSION \
     && ./emsdk activate $EMSDK_VERSION \
     && npm install --ignore-scripts -g xhr2 \
+    && ./upstream/emscripten/embuilder build sdl3 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && chown -R root:users $EMSDK_HOME && chmod -R 777 $EMSDK_HOME
@@ -95,6 +96,12 @@ RUN git clone --depth 1 --branch ${ACPP_GIT_REF} https://github.com/AdaptiveCpp/
  && cmake --build /tmp/AdaptiveCpp/build \
  && cmake --install /tmp/AdaptiveCpp/build \
  && rm -rf /tmp/AdaptiveCpp
+
+RUN apt-get update && \
+    apt-get install -y software-properties-common && \
+    add-apt-repository universe && \
+    apt-get update && \
+    apt-get install -y libcpr-dev
 
 ENV PATH="${ACPP_INSTALL_PREFIX}/bin:${PATH}"
 

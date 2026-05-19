@@ -44,7 +44,7 @@ constexpr void simd_epilogue(auto kWidth, F&& fun) {
 
 template<std::ranges::contiguous_range... Ts, typename Flag = stdx::element_aligned_tag>
 constexpr auto simdize_tuple_load_and_apply(auto width, const std::tuple<Ts...>& rngs, auto offset, auto&& fun, Flag f = {}) {
-    using Tup = vir::simdize<std::tuple<std::ranges::range_value_t<Ts>...>, width>;
+    using Tup = gr::meta::simdize<std::tuple<std::ranges::range_value_t<Ts>...>, width>;
     return [&]<std::size_t... Is>(std::index_sequence<Is...>) { return fun(std::tuple_element_t<Is, Tup>(std::ranges::data(std::get<Is>(rngs)) + offset, f)...); }(std::make_index_sequence<sizeof...(Ts)>());
 }
 
@@ -164,8 +164,8 @@ template<auto... MatchPortEnums, std::ranges::input_range RangeA, std::ranges::i
 
 template<typename Derived, PortDirection portDirection, PortType portType>
 class PortCache {
-    using AllocatorSize    = gr::allocator::Aligned<std::size_t, gr::meta::kCacheLine>;
-    using AllocatorBitMask = gr::allocator::Aligned<port::BitMask, gr::meta::kCacheLine>;
+    using AllocatorSize    = gr::allocator::Aligned<std::size_t, gr::kCacheLine>;
+    using AllocatorBitMask = gr::allocator::Aligned<port::BitMask, gr::kCacheLine>;
 
     // reference to derived class containing the ports
     Derived& _self;
@@ -349,7 +349,7 @@ public:
             }
 
             if (!port.isConnected()) {
-                result = std::unexpected(gr::Error(std::format("primePort({}, {}) - port {} ({}) is not connected", portIdx, nSamples, portIdx, port.name), loc));
+                result = std::unexpected(gr::Error(std::format("primePort({}, {}) - port {} ({}) is not connected", portIdx, nSamples, portIdx, port.metaInfo.name), loc));
                 return;
             }
 
@@ -428,46 +428,6 @@ public:
 
 namespace work {
 
-class Counter {
-    std::atomic_uint64_t encodedCounter{static_cast<uint64_t>(std::numeric_limits<gr::Size_t>::max()) << 32};
-
-public:
-    void increment(std::size_t workRequestedInc, std::size_t workDoneInc) {
-        uint64_t oldCounter;
-        uint64_t newCounter;
-        do {
-            oldCounter         = encodedCounter;
-            auto workRequested = static_cast<gr::Size_t>(oldCounter >> 32);
-            auto workDone      = static_cast<gr::Size_t>(oldCounter & 0xFFFFFFFF);
-            if (workRequested != std::numeric_limits<gr::Size_t>::max()) {
-                workRequested = static_cast<uint32_t>(std::min(static_cast<std::uint64_t>(workRequested) + workRequestedInc, static_cast<std::uint64_t>(std::numeric_limits<gr::Size_t>::max())));
-            }
-            workDone += static_cast<gr::Size_t>(workDoneInc);
-            newCounter = (static_cast<uint64_t>(workRequested) << 32) | workDone;
-        } while (!encodedCounter.compare_exchange_weak(oldCounter, newCounter));
-    }
-
-    std::pair<std::size_t, std::size_t> getAndReset() {
-        uint64_t oldCounter    = encodedCounter.exchange(0);
-        auto     workRequested = static_cast<gr::Size_t>(oldCounter >> 32);
-        auto     workDone      = static_cast<gr::Size_t>(oldCounter & 0xFFFFFFFF);
-        if (workRequested == std::numeric_limits<gr::Size_t>::max()) {
-            return {std::numeric_limits<std::size_t>::max(), static_cast<std::size_t>(workDone)};
-        }
-        return {static_cast<std::size_t>(workRequested), static_cast<std::size_t>(workDone)};
-    }
-
-    std::pair<std::size_t, std::size_t> get() const {
-        uint64_t oldCounter    = std::atomic_load_explicit(&encodedCounter, std::memory_order_acquire);
-        auto     workRequested = static_cast<gr::Size_t>(oldCounter >> 32);
-        auto     workDone      = static_cast<gr::Size_t>(oldCounter & 0xFFFFFFFF);
-        if (workRequested == std::numeric_limits<std::uint32_t>::max()) {
-            return {std::numeric_limits<std::size_t>::max(), static_cast<std::size_t>(workDone)};
-        }
-        return {static_cast<std::size_t>(workRequested), static_cast<std::size_t>(workDone)};
-    }
-};
-
 enum class Status {
     ERROR                     = -100, /// error occurred in the work function
     INSUFFICIENT_OUTPUT_ITEMS = -3,   /// work requires a larger output buffer to produce output
@@ -481,46 +441,42 @@ struct Result {
     std::size_t performed_work = 0;
     Status      status         = Status::OK;
 };
+
+/// if the block reported an error or insufficient buffers, zero the counts
+inline void sanitiseProcessStatus(Status status, std::size_t& processedIn, std::size_t& processedOut) noexcept {
+    if (status == Status::INSUFFICIENT_OUTPUT_ITEMS || status == Status::INSUFFICIENT_INPUT_ITEMS || status == Status::ERROR) {
+        processedIn  = 0UZ;
+        processedOut = 0UZ;
+    }
+}
+
+/// compute how much work was performed — used by the scheduler for block prioritisation
+inline std::size_t computePerformedWork(Status status, std::size_t processedIn, std::size_t processedOut, bool isSource) noexcept {
+    if (status != Status::OK) {
+        return 0UZ;
+    }
+    return isSource ? processedOut : processedIn;
+}
+
 } // namespace work
 
-template<typename T>
-concept HasWork = requires(T t, std::size_t requested_work) {
-    { t.work(requested_work) } -> std::same_as<work::Result>;
+} // namespace gr
+
+// Compile-time performance override; phased out with C++26 reflection.
+namespace gr::meta::detail {
+template<>
+struct EnumTraits<gr::work::Status> {
+    static constexpr std::array<std::pair<gr::work::Status, std::string_view>, 5> entries = {{
+        {gr::work::Status::ERROR, "ERROR"},
+        {gr::work::Status::INSUFFICIENT_OUTPUT_ITEMS, "INSUFFICIENT_OUTPUT_ITEMS"},
+        {gr::work::Status::INSUFFICIENT_INPUT_ITEMS, "INSUFFICIENT_INPUT_ITEMS"},
+        {gr::work::Status::DONE, "DONE"},
+        {gr::work::Status::OK, "OK"},
+    }};
 };
+} // namespace gr::meta::detail
 
-template<typename T>
-concept BlockLike = requires(T t, std::size_t requested_work) {
-    { t.unique_name } -> std::convertible_to<const std::string&>;
-    { unwrap_if_wrapped_t<decltype(t.name)>{} } -> std::same_as<std::string>;
-    { unwrap_if_wrapped_t<decltype(t.meta_information)>{} } -> std::same_as<property_map>;
-    { t.description } noexcept -> std::same_as<const std::string_view&>;
-
-    { t.isBlocking() } noexcept -> std::same_as<bool>;
-
-    { t.settings() } -> std::same_as<SettingsBase&>;
-
-    // N.B. TODO discuss these requirements
-    requires !std::is_copy_constructible_v<T>;
-    requires !std::is_copy_assignable_v<T>;
-} && HasWork<T>;
-
-template<typename Derived>
-concept HasProcessOneFunction = traits::block::can_processOne<Derived>;
-
-template<typename Derived>
-concept HasConstProcessOneFunction = traits::block::can_processOne_const<Derived>;
-
-template<typename Derived>
-concept HasNoexceptProcessOneFunction = HasProcessOneFunction<Derived> && gr::meta::IsNoexceptMemberFunction<decltype(&Derived::processOne)>;
-
-template<typename Derived>
-concept HasProcessBulkFunction = traits::block::can_processBulk<Derived>;
-
-template<typename Derived>
-concept HasNoexceptProcessBulkFunction = HasProcessBulkFunction<Derived> && gr::meta::IsNoexceptMemberFunction<decltype(&Derived::processBulk)>;
-
-template<typename Derived>
-concept HasRequiredProcessFunction = (HasProcessBulkFunction<Derived> or HasProcessOneFunction<Derived>) and (HasProcessOneFunction<Derived> + HasProcessBulkFunction<Derived>) == 1;
+namespace gr {
 
 template<typename TBlock, typename TDecayedBlock = std::remove_cvref_t<TBlock>>
 inline void checkBlockContracts();
@@ -531,23 +487,86 @@ struct isBlockDependent {
 };
 
 namespace block::property {
-inline static const char* kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
-inline static const char* kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
-inline static const char* kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
-inline static const char* kSetting        = "Settings";       ///< asynchronous message-based setting handling,
-                                                              // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
-inline static const char* kStagedSetting = "StagedSettings";  ///< asynchronous message-based staging of settings
+// [[maybe_unused]]: names referenced only from Block.cpp (initStandardPropertyCallbacks) and user code — silences -Werror=unused-variable on TUs that include only the header.
+[[maybe_unused]] inline static const char* const kHeartbeat      = "Heartbeat";      ///< heartbeat property - the canary in the coal mine (supports block-specific subscribe/unsubscribe)
+[[maybe_unused]] inline static const char* const kEcho           = "Echo";           ///< basic property that receives any matching message and sends a mirror with it's serviceName/unique_name
+[[maybe_unused]] inline static const char* const kLifeCycleState = "LifecycleState"; ///< basic property that sets the block's @see lifecycle::StateMachine
+[[maybe_unused]] inline static const char* const kSetting        = "Settings";       ///< asynchronous message-based setting handling,
+                                                                                     // N.B. 'Set' Settings are first staged before being applied within the work(...) function (real-time/non-real-time decoupling)
+[[maybe_unused]] inline static const char* const kStagedSetting = "StagedSettings";  ///< asynchronous message-based staging of settings
 
-inline static const char* kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
-inline static const char* kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
+[[maybe_unused]] inline static const char* const kMetaInformation = "MetaInformation"; ///< asynchronous message-based retrieval of the static meta-information (i.e. Annotated<> interfaces, constraints, etc...)
+[[maybe_unused]] inline static const char* const kUiConstraints   = "UiConstraints";   ///< asynchronous message-based retrieval of user-defined UI constraints
 
-inline static const char* kStoreDefaults    = "StoreDefaults";    ///< store present settings as default, for counterpart @see kResetDefaults
-inline static const char* kResetDefaults    = "ResetDefaults";    ///< retrieve and reset to default setting, for counterpart @see kStoreDefaults
-inline static const char* kActiveContext    = "ActiveContext";    ///< retrieve and set active context
-inline static const char* kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
-inline static const char* kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline static const char* const kStoreDefaults    = "StoreDefaults";    ///< store present settings as default, for counterpart @see kResetDefaults
+[[maybe_unused]] inline static const char* const kResetDefaults    = "ResetDefaults";    ///< retrieve and reset to default setting, for counterpart @see kStoreDefaults
+[[maybe_unused]] inline static const char* const kActiveContext    = "ActiveContext";    ///< retrieve and set active context
+[[maybe_unused]] inline static const char* const kSettingsCtx      = "SettingsCtx";      ///< retrieve/creates/remove a new stored context
+[[maybe_unused]] inline static const char* const kSettingsContexts = "SettingsContexts"; ///< retrieve/creates/remove a new stored context
 
 } // namespace block::property
+
+/**
+ * @brief Non-templated base providing accessor function pointers for the 12 standard propertyCallback implementations.
+ *
+ * By compiling these callbacks once (in BlockBase.cpp) instead of per Block<T> instantiation,
+ * this eliminates ~147 KiB of duplicated .text across 14 block types. The callbacks operate
+ * exclusively through stored function pointers to SettingsBase& and non-templated data.
+ *
+ * Uses function pointers (not virtual functions) to avoid introducing a vtable, which would
+ * break aggregate initialization of derived block types.
+ */
+struct BlockBase {
+    using PropertyCallback = std::optional<Message> (BlockBase::*)(std::string_view, Message);
+
+    // Pointer to the actual Block<Derived> object. Required because Block<Derived> uses multiple
+    // inheritance (StateMachine + BlockBase), so BlockBase's `this` differs from the Block* address.
+    void* _blockSelf = nullptr;
+
+    // Non-virtual accessor function pointers, set by Block<Derived> constructor (cold-path only)
+    SettingsBase& (*_cbSettings)(void*)                                     = nullptr;
+    lifecycle::State (*_cbState)(const void*)                               = nullptr;
+    std::expected<void, Error> (*_cbChangeStateTo)(void*, lifecycle::State) = nullptr;
+    std::string_view (*_cbUniqueName)(const void*)                          = nullptr;
+    std::string_view (*_cbName)(const void*)                                = nullptr;
+    property_map& (*_cbMetaInformation)(void*)                              = nullptr;
+    property_map& (*_cbUiConstraints)(void*)                                = nullptr;
+
+    // Hook for GraphWrapper to handle subgraph export port messages on any block type
+    using SubgraphExportHandler                  = std::optional<Message> (*)(void* context, Message);
+    SubgraphExportHandler _subgraphExportHandler = nullptr;
+    void*                 _subgraphExportContext = nullptr;
+
+    std::map<std::string, PropertyCallback>      propertyCallbacks;
+    std::map<std::string, std::set<std::string>> propertySubscriptions;
+
+    // out-of-line so the 12-entry map literal is compiled once, not per Block<T>::Block body.
+    void initStandardPropertyCallbacks() noexcept;
+
+    // accessor helpers (delegate to function pointers, using _blockSelf for correct Block* address)
+    SettingsBase&              cbSettings() { return _cbSettings(_blockSelf); }
+    lifecycle::State           cbState() const { return _cbState(_blockSelf); }
+    std::expected<void, Error> cbChangeStateTo(lifecycle::State s) { return _cbChangeStateTo(_blockSelf, s); }
+    std::string_view           cbUniqueName() const { return _cbUniqueName(_blockSelf); }
+    std::string_view           cbName() const { return _cbName(_blockSelf); }
+    property_map&              cbMetaInformation() { return _cbMetaInformation(_blockSelf); }
+    property_map&              cbUiConstraints() { return _cbUiConstraints(_blockSelf); }
+
+    // 12 callback implementations (compiled once, not per block type)
+    std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackEcho(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackSettings(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackStagedSettings(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackStoreDefaults(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackResetDefaults(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackActiveContext(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackSettingsCtx(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackSettingsContexts(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message);
+    std::optional<Message> propertyCallbackSubgraphExport(std::string_view propertyName, Message message);
+};
 
 namespace block {
 enum class Category {
@@ -682,8 +701,8 @@ enum class Category {
  * @tparam Arguments NTTP list containing the compile-time defined port instances, setting structs, or other constraints.
  */
 template<typename Derived, typename... Arguments>
-class Block : public lifecycle::StateMachine<Derived> {
-    static std::atomic_size_t _uniqueIdCounter;
+class Block : public lifecycle::StateMachine<Derived>, public BlockBase {
+    static inline std::size_t _uniqueIdCounter{0UZ};
     template<typename T, gr::meta::fixed_string description = "", typename... Args>
     using A = Annotated<T, description, Args...>;
 
@@ -697,9 +716,10 @@ public:
     using AllowIncompleteFinalUpdate = ArgumentsTypeList::template find_or_default<is_incompleteFinalUpdatePolicy, IncompleteFinalUpdatePolicy<IncompleteFinalUpdateEnum::DROP>>;
     using DrawableControl            = ArgumentsTypeList::template find_or_default<is_drawable, Drawable<UICategory::None, "">>;
 
-    constexpr static bool blockingIO             = std::disjunction_v<std::is_same<BlockingIO<true>, Arguments>..., std::is_same<BlockingIO<false>, Arguments>...>;
-    constexpr static bool noDefaultTagForwarding = std::disjunction_v<std::is_same<NoDefaultTagForwarding, Arguments>...>;
-    constexpr static bool backwardTagForwarding  = std::disjunction_v<std::is_same<BackwardTagForwarding, Arguments>...>;
+    constexpr static bool noTagPropagation       = std::disjunction_v<std::is_same<NoTagPropagation, Arguments>...>;
+    constexpr static bool forwardTagPropagation  = std::disjunction_v<std::is_same<ForwardTagPropagation, Arguments>...>;
+    constexpr static bool backwardTagPropagation = std::disjunction_v<std::is_same<BackwardTagPropagation, Arguments>...>;
+    constexpr static bool mergeTagPropagation    = std::disjunction_v<std::is_same<MergeTagPropagation, Arguments>...>;
 
     constexpr static block::Category blockCategory = block::Category::NormalBlock;
 
@@ -713,11 +733,7 @@ public:
         return std::get<T>(*this);
     }
 
-    alignas(hardware_destructive_interference_size) std::atomic<std::size_t> ioRequestedWork{std::numeric_limits<std::size_t>::max()};
-    alignas(hardware_destructive_interference_size) work::Counter ioWorkDone{};
-    alignas(hardware_destructive_interference_size) std::atomic<work::Status> ioLastWorkStatus{work::Status::OK};
-    alignas(hardware_destructive_interference_size) std::shared_ptr<gr::Sequence> progress = std::make_shared<gr::Sequence>();
-    alignas(hardware_destructive_interference_size) std::atomic<bool> ioThreadRunning{false};
+    alignas(kCacheLine) std::shared_ptr<gr::Sequence> progress = std::make_shared<gr::Sequence>();
 
     using ResamplingValue = std::conditional_t<ResamplingControl::kIsConst, const gr::Size_t, gr::Size_t>;
     using ResamplingLimit = Limits<1UL, std::numeric_limits<ResamplingValue>::max()>;
@@ -732,7 +748,7 @@ public:
 
     gr::Size_t strideCounter = 0UL; // leftover stride from previous calls
 
-    gr::meta::immutable<std::size_t> unique_id   = _uniqueIdCounter++;
+    gr::meta::immutable<std::size_t> unique_id   = gr::atomic_ref(_uniqueIdCounter).fetch_add(1UZ);
     gr::meta::immutable<std::string> unique_name = std::format("{}#{}", gr::meta::type_name<Derived>(), unique_id);
 
     //
@@ -746,7 +762,7 @@ public:
         }
     }();
 #ifndef __EMSCRIPTEN__
-    static_assert(std::atomic<lifecycle::State>::is_always_lock_free, "std::atomic<lifecycle::State> is not lock-free");
+    static_assert(std::atomic_ref<lifecycle::State>::is_always_lock_free, "std::atomic_ref<lifecycle::State> is not lock-free");
 #endif
 
     //
@@ -755,7 +771,7 @@ public:
         property_map ret;
         if constexpr (!std::is_same_v<NotDrawable, DrawableControl>) {
             property_map info;
-            info.insert_or_assign("Category", std::string(magic_enum::enum_name(DrawableControl::kCategory)));
+            info.insert_or_assign("Category", std::string(gr::meta::enumName(DrawableControl::kCategory).value_or("")));
             info.insert_or_assign("Toolkit", std::string(DrawableControl::kToolkit));
 
             ret.insert_or_assign("Drawable", info);
@@ -774,31 +790,19 @@ public:
     MsgPortInBuiltin  msgIn;
     MsgPortOutBuiltin msgOut;
 
-    using PropertyCallback = std::function<std::optional<Message>(Derived&, std::string_view, Message)>;
-    std::map<std::string, PropertyCallback> propertyCallbacks{
-        {block::property::kHeartbeat, std::mem_fn(&Block::propertyCallbackHeartbeat)},               //
-        {block::property::kEcho, std::mem_fn(&Block::propertyCallbackEcho)},                         //
-        {block::property::kLifeCycleState, std::mem_fn(&Block::propertyCallbackLifecycleState)},     //
-        {block::property::kSetting, std::mem_fn(&Block::propertyCallbackSettings)},                  //
-        {block::property::kStagedSetting, std::mem_fn(&Block::propertyCallbackStagedSettings)},      //
-        {block::property::kStoreDefaults, std::mem_fn(&Block::propertyCallbackStoreDefaults)},       //
-        {block::property::kResetDefaults, std::mem_fn(&Block::propertyCallbackResetDefaults)},       //
-        {block::property::kActiveContext, std::mem_fn(&Block::propertyCallbackActiveContext)},       //
-        {block::property::kSettingsCtx, std::mem_fn(&Block::propertyCallbackSettingsCtx)},           //
-        {block::property::kSettingsContexts, std::mem_fn(&Block::propertyCallbackSettingsContexts)}, //
-        {block::property::kMetaInformation, std::mem_fn(&Block::propertyCallbackMetaInformation)},   //
-        {block::property::kUiConstraints, std::mem_fn(&Block::propertyCallbackUiConstraints)},       //
-    };
-    std::map<std::string, std::set<std::string>> propertySubscriptions;
+    // PropertyCallback, propertyCallbacks and propertySubscriptions are inherited from BlockBase
+
+    std::pmr::memory_resource* _allocResource = std::pmr::get_default_resource(); // pmr resource for internal and derived-block pmr fields
 
     PortCache<Derived, PortDirection::INPUT, PortType::STREAM>  inputStreamCache;
     PortCache<Derived, PortDirection::OUTPUT, PortType::STREAM> outputStreamCache;
 
-protected:
-    Tag _mergedInputTag{};
-
-    bool             _outputTagsChanged = false; // It is used to indicate that processOne published a Tag and want prematurely break a loop. Should be set to "true" in block implementation processOne().
-    std::vector<Tag> _outputTags{};              // This std::vector is used to cache published Tags when block implements processOne method. The tags are then copied to output spans. Note: that for he processOne each tag is published for all output ports
+    // processOne tag state — valid ONLY during workInternal dispatch (this is a performance optimisation).
+    bool         _inProcessOneDispatch = false;
+    bool         _inputTagPresent      = false;
+    Tag          _mergedInputTag{};
+    bool         _outputTagPending = false;
+    property_map _pendingOutputTag{};
 
     // intermediate non-real-time<->real-time setting states
     CtxSettings<Derived> _settings;
@@ -806,6 +810,16 @@ protected:
     [[nodiscard]] constexpr auto&       self() noexcept { return *static_cast<Derived*>(this); }
     [[nodiscard]] constexpr const auto& self() const noexcept { return *static_cast<const Derived*>(this); }
 
+protected: // BlockBase function-pointer plumbing — not part of the user API
+    static SettingsBase&              cbSettingsImpl(void* self) { return static_cast<Block*>(self)->_settings; }
+    static lifecycle::State           cbStateImpl(const void* self) { return static_cast<const Block*>(self)->state(); }
+    static std::expected<void, Error> cbChangeStateToImpl(void* self, lifecycle::State s) { return static_cast<Block*>(self)->changeStateTo(s); }
+    static std::string_view           cbUniqueNameImpl(const void* self) { return static_cast<const Block*>(self)->unique_name; }
+    static std::string_view           cbNameImpl(const void* self) { return static_cast<const Block*>(self)->name; }
+    static property_map&              cbMetaInformationImpl(void* self) { return static_cast<Block*>(self)->meta_information.value; }
+    static property_map&              cbUiConstraintsImpl(void* self) { return static_cast<Block*>(self)->ui_constraints.value; }
+
+public:
     template<typename TFunction, typename... Args>
     [[maybe_unused]] constexpr inline auto invokeUserProvidedFunction(std::string_view callingSite, TFunction&& func, Args&&... args, const std::source_location& location = std::source_location::current()) noexcept {
         if constexpr (noexcept(func(std::forward<Args>(args)...))) { // function declared as 'noexcept' skip exception handling
@@ -831,6 +845,20 @@ public:
           inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)), //
           _settings(CtxSettings<Derived>(*static_cast<Derived*>(this))) {                                  // N.B. safe delegated use of this (i.e. not used during construction)
 
+        // store the actual Block* address (differs from BlockBase's this due to multiple inheritance)
+        _blockSelf = static_cast<void*>(this);
+
+        // initialize inherited BlockBase accessor function pointers
+        _cbSettings        = &Block::cbSettingsImpl;
+        _cbState           = &Block::cbStateImpl;
+        _cbChangeStateTo   = &Block::cbChangeStateToImpl;
+        _cbUniqueName      = &Block::cbUniqueNameImpl;
+        _cbName            = &Block::cbNameImpl;
+        _cbMetaInformation = &Block::cbMetaInformationImpl;
+        _cbUiConstraints   = &Block::cbUiConstraintsImpl;
+
+        initStandardPropertyCallbacks();
+
         // check Block<T> contracts
         checkBlockContracts<decltype(*static_cast<Derived*>(this))>();
 
@@ -840,19 +868,23 @@ public:
     }
 
     Block(Block&& other) noexcept
-        : lifecycle::StateMachine<Derived>(std::move(other)),                                                                                                                                                                    //
-          input_chunk_size(std::move(other.input_chunk_size)), output_chunk_size(std::move(other.output_chunk_size)),                                                                                                            //
-          stride(std::move(other.stride)),                                                                                                                                                                                       //
-          disconnect_on_done(other.disconnect_on_done),                                                                                                                                                                          //
-          compute_domain(std::move(other.compute_domain)),                                                                                                                                                                       //
-          strideCounter(other.strideCounter),                                                                                                                                                                                    //
-          unique_id(std::move(other.unique_id)), unique_name(std::move(other.unique_name)), name(std::move(other.name)),                                                                                                         //
-          ui_constraints(std::move(other.ui_constraints)), meta_information(std::move(other.meta_information)),                                                                                                                  //
-          msgIn(std::move(other.msgIn)), msgOut(std::move(other.msgOut)),                                                                                                                                                        //
-          propertyCallbacks(std::move(other.propertyCallbacks)), propertySubscriptions(std::move(other.propertySubscriptions)), inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)), //
-          _mergedInputTag(std::move(other._mergedInputTag)), _outputTagsChanged(std::move(other._outputTagsChanged)), _outputTags(std::move(other._outputTags)),                                                                 //
-          _settings(CtxSettings<Derived>(*static_cast<Derived*>(this), std::move(other._settings)))                                                                                                                              //
-    {}
+        : lifecycle::StateMachine<Derived>(std::move(other)),                                                            //
+          BlockBase(std::move(other)),                                                                                   //
+          input_chunk_size(std::move(other.input_chunk_size)), output_chunk_size(std::move(other.output_chunk_size)),    //
+          stride(std::move(other.stride)),                                                                               //
+          disconnect_on_done(other.disconnect_on_done),                                                                  //
+          compute_domain(std::move(other.compute_domain)),                                                               //
+          strideCounter(other.strideCounter),                                                                            //
+          unique_id(std::move(other.unique_id)), unique_name(std::move(other.unique_name)), name(std::move(other.name)), //
+          ui_constraints(std::move(other.ui_constraints)), meta_information(std::move(other.meta_information)),          //
+          msgIn(std::move(other.msgIn)), msgOut(std::move(other.msgOut)),                                                //
+          inputStreamCache(static_cast<Derived&>(*this)), outputStreamCache(static_cast<Derived&>(*this)),               //
+          _inProcessOneDispatch{false}, _inputTagPresent{false}, _outputTagPending{false},                               //
+          _settings(CtxSettings<Derived>(*static_cast<Derived*>(this), std::move(other._settings)))                      //
+    {
+        _blockSelf       = static_cast<void*>(this);
+        other._blockSelf = nullptr;
+    }
 
     Block& operator=(Block&& other) noexcept = delete;
 
@@ -860,9 +892,6 @@ public:
         if (lifecycle::isActive(this->state())) {
             // Only happens in artificial cases likes qa_Block test. In practice blocks stay in zombie list if active
             emitErrorMessageIfAny("~Block()", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
-        }
-        if constexpr (blockingIO) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         // wait for done
@@ -880,15 +909,15 @@ public:
         // Set names of port member variables
         // TODO: Refactor the library not to assign names to ports. The
         // block and the graph are the only things that need the port name
-        auto setPortName = [&](std::size_t, auto* t) {
+        auto setPortName = [this](std::size_t, auto* t) {
             using Description = std::remove_pointer_t<decltype(t)>;
             auto& port        = Description::getPortObject(self());
             if constexpr (Description::kIsDynamicCollection || Description::kIsStaticCollection) {
                 for (auto& actualPort : port) {
-                    actualPort.name = Description::Name;
+                    actualPort.metaInfo.name = Description::Name;
                 }
             } else {
-                port.name = Description::Name;
+                port.metaInfo.name = Description::Name;
             }
         };
         traits::block::all_input_ports<Derived>::for_each(setPortName);
@@ -896,26 +925,29 @@ public:
 
         settings().init();
 
-        // important: these tags need to be queued because at this stage the block is not yet connected to other downstream blocks
+        // apply initial settings — forward params re-staged so first workInternal publishes them
         invokeUserProvidedFunction("init() - applyStagedParameters", [this] noexcept(false) {
-            if (const auto applyResult = settings().applyStagedParameters(); !applyResult.forwardParameters.empty()) {
-                if constexpr (!noDefaultTagForwarding) {
-                    publishTag(applyResult.forwardParameters, 0);
-                }
+            auto applyResult = settings().applyStagedParameters();
+            if (!applyResult.appliedParameters.empty()) {
                 notifyListeners(block::property::kSetting, settings().get());
             }
+            if constexpr (!noTagPropagation) {
+                if (!applyResult.forwardParameters.empty()) {
+                    std::ignore = settings().setStaged(applyResult.forwardParameters);
+                }
+            }
         });
-        checkBlockParameterConsistency();
+        if constexpr (gr::meta::kDebugBuild) {
+            checkBlockParameterConsistency();
+        }
         // store default settings -> can be recovered with 'resetDefaults()'
         settings().storeDefaults();
         emitErrorMessageIfAny("init(..) -> INITIALISED", this->changeStateTo(lifecycle::State::INITIALISED));
     }
 
-    [[nodiscard]] constexpr bool isBlocking() const noexcept { return blockingIO; }
+    [[nodiscard]] constexpr bool isBlocking() const noexcept { return false; }
 
-    [[nodiscard]] constexpr bool inputTagsPresent() const noexcept { return !_mergedInputTag.map.empty(); };
-
-    [[nodiscard]] constexpr const Tag& mergedInputTag() const noexcept { return _mergedInputTag; }
+    // tag access (#625): processBulk blocks use inSpan.tags() directly; processOne blocks use inputTagsPresent() + mergedInputTag()
 
     [[nodiscard]] constexpr const SettingsBase& settings() const noexcept { return _settings; }
 
@@ -960,9 +992,6 @@ public:
                 return;
             }
         }
-        // TODO: remove these obsolete lines
-        // const auto [minSyncIn, maxSyncIn, _, _1]    = getPortLimits(inputPorts<PortType::STREAM>(&self()));
-        // const auto [minSyncOut, maxSyncOut, _2, _3] = getPortLimits(outputPorts<PortType::STREAM>(&self()));
         inputStreamCache.invalidateConfig();
         outputStreamCache.invalidateConfig();
         const std::size_t minSyncIn  = inputStreamCache.minSyncRequirement();
@@ -1056,114 +1085,173 @@ public:
     constexpr auto invoke_processOne_simd(auto width, Ts&&... input_simds) {
         if constexpr (sizeof...(Ts) == 0) {
             if constexpr (traits::block::stream_output_ports<Derived>::size == 0) {
-                self().processOne_simd(width);
+                self().processOne(width);
                 return std::tuple{};
             } else if constexpr (traits::block::stream_output_ports<Derived>::size == 1) {
-                return std::tuple{self().processOne_simd(width)};
+                return std::tuple{self().processOne(width)};
             } else {
-                return self().processOne_simd(width);
+                return self().processOne(width);
             }
         } else {
             return invoke_processOne(std::forward<Ts>(input_simds)...);
         }
     }
 
-    constexpr void publishMergedInputTag(auto& outputSpanTuple) noexcept {
-        if constexpr (!noDefaultTagForwarding) {
-            if (inputTagsPresent()) {
-                const auto&  autoForwardKeys = settings().autoForwardParameters();
-                property_map onlyAutoForwardMap;
-                std::ranges::copy_if(_mergedInputTag.map, std::inserter(onlyAutoForwardMap, onlyAutoForwardMap.end()), [&autoForwardKeys](const auto& kv) { return autoForwardKeys.contains(convert_string_domain(kv.first)); });
-                for_each_writer_span([&onlyAutoForwardMap](auto& outSpan) { outSpan.publishTag(onlyAutoForwardMap, 0); }, outputSpanTuple);
-            }
-        }
-    }
-
-    constexpr void publishCachedOutputTags(auto& outputSpanTuple) noexcept {
-        if (_outputTags.empty()) {
+    /// default tag forwarding — called by workInternal unless the user provides forwardTags()
+    template<typename TInputSpans, typename TOutputSpans>
+    void forwardInputTags(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t processedIn) noexcept {
+        if constexpr (noTagPropagation) {
             return;
         }
-        for (const auto& tag : _outputTags) {
-            for_each_writer_span([&tag](auto& outSpan) { outSpan.publishTag(tag.map, tag.index); }, outputSpanTuple);
-        }
-        _outputTags.clear();
-    }
+        const auto&       autoForwardKeys = settings().autoForwardParameters();
+        const auto&       blockSettings   = CtxSettings<Derived>::allWritableMembers();
+        const std::size_t tagWindow       = backwardTagPropagation ? processedIn : 1UZ;
 
-    /**
-     * Merge tags from all sync ports into one merged tag, apply auto-update parameters
-     */
-    void updateMergedInputTagAndApplySettings(auto& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
-        std::size_t untilLocalIndexAdjusted = untilLocalIndex;
-        if constexpr (!backwardTagForwarding) {
-            untilLocalIndexAdjusted = 1UZ;
-        }
-        const auto isIndexEqual       = [](const auto& lhs, const auto& rhs) { return lhs.first == rhs.first; };
-        const auto isIndexAndMapEqual = [](const auto& lhs, const auto& rhs) { return lhs.first == rhs.first && lhs.second.get() == rhs.second.get(); };
+        std::optional<property_map> cachedSettings;
+        auto                        filterAndSubstitute = [&](const property_map& src) {
+            property_map dst;
+            for (const auto& [key, value] : src) {
+                auto shortKey = convert_string_domain(key);
+                if (!autoForwardKeys.contains(shortKey)) {
+                    continue;
+                }
+                if (!cachedSettings) {
+                    cachedSettings.emplace(settings().get());
+                }
+                if (auto it = cachedSettings->find(key); blockSettings.contains(shortKey) && it != cachedSettings->end()) {
+                    dst.insert_or_assign(key, it->second);
+                } else {
+                    dst.insert_or_assign(key, value);
+                }
+            }
+            return dst;
+        };
 
-        // TODO: we still fill _mergedInputTag, but this will be removed in the one of the next PR
-        for_each_reader_span(
-            [this, untilLocalIndexAdjusted, isIndexEqual, isIndexAndMapEqual](auto& in) {
-                if (in.isSync && in.isConnected) {
-                    auto inTags = in.tags(untilLocalIndexAdjusted) | PairDeduplicateView(isIndexEqual, isIndexAndMapEqual);
-                    for (const auto& [_, tagMap] : inTags) {
-                        for (const auto& [key, value] : tagMap.get()) {
-                            _mergedInputTag.map.insert_or_assign(key, value);
+        auto publishFiltered = [&](std::ptrdiff_t relIndex, const property_map& tagMap) {
+            auto forwarded = filterAndSubstitute(tagMap);
+            if (!forwarded.empty()) {
+                const auto offset = backwardTagPropagation ? 0UZ : static_cast<std::size_t>(std::max(std::ptrdiff_t(0), relIndex));
+                for_each_writer_span([&forwarded, offset](auto& out) { out.publishTag(forwarded, offset); }, outputSpans);
+            }
+        };
+
+        if constexpr (mergeTagPropagation) {
+            // MergeTagPropagation: all auto-forward keys → one output tag at position 0
+            property_map merged;
+            for_each_reader_span(
+                [&tagWindow, &filterAndSubstitute, &merged](auto& in) {
+                    if (!in.isSync || !in.isConnected) {
+                        return;
+                    }
+                    for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
+                        auto filtered = filterAndSubstitute(tagMapRef.get());
+                        for (auto& [key, value] : filtered) {
+                            merged.insert_or_assign(key, std::move(value));
                         }
                     }
-                }
-            },
-            inputSpans);
-
-        // non-duplicated, ordered by index, the last Tag (wih max index) wins
-        using InputSpanT = typename gr::PortIn<float>::InputSpan<SpanReleasePolicy::ProcessNone>;
-        using ViewT      = decltype(std::declval<InputSpanT>().tags(0UZ));
-        std::vector<ViewT> allPairViews;
-        allPairViews.reserve(8);
-        for_each_reader_span(
-            [&allPairViews, untilLocalIndexAdjusted](auto& in) {
-                if (in.isSync && in.isConnected) {
-                    auto inTags = in.tags(untilLocalIndexAdjusted);
-                    static_assert(std::ranges::input_range<decltype(inTags)>);
-                    static_assert(std::ranges::forward_range<decltype(inTags)>);
-                    allPairViews.push_back(std::move(inTags));
-                }
-            },
-            inputSpans);
-
-        auto mergedPairsLazy        = allPairViews | Merge{[](const PairRelIndexMapRef& lhs, const PairRelIndexMapRef& rhs) { return lhs.first < rhs.first; }};
-        auto nonDuplicatedInputTags = mergedPairsLazy | PairDeduplicateView(isIndexEqual, isIndexAndMapEqual);
-
-        if (inputTagsPresent()) {
-            for (const auto& tag : nonDuplicatedInputTags) {
-                // TODO: autoUpdate does not really need Tag, it should be changed to accept property_map
-                settings().autoUpdate(Tag{tag.first < 0 ? 0UZ : static_cast<std::size_t>(tag.first), tag.second.get()});
+                },
+                inputSpans);
+            if (!merged.empty()) {
+                for_each_writer_span([&merged](auto& out) { out.publishTag(merged, 0); }, outputSpans);
             }
+            return;
         }
 
-        // update PortMetaInfo
+        constexpr std::size_t kNInputPorts = traits::block::stream_input_ports<Derived>::size;
+
+        if constexpr (kNInputPorts <= 1) {
+            for_each_reader_span(
+                [&tagWindow, &publishFiltered](auto& in) {
+                    if (!in.isSync || !in.isConnected) {
+                        return;
+                    }
+                    for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
+                        publishFiltered(relIndex, tagMapRef.get());
+                    }
+                },
+                inputSpans);
+        } else {
+            using SeenEntry                                      = std::pair<std::ptrdiff_t, const property_map*>;
+            constexpr std::size_t                 kDedupCapacity = 8UZ;
+            std::array<SeenEntry, kDedupCapacity> seen{};
+            std::size_t                           nSeen = 0;
+
+            for_each_reader_span(
+                [&tagWindow, &publishFiltered, &seen, &nSeen, kDedupCapacity](auto& in) {
+                    if (!in.isSync || !in.isConnected) {
+                        return;
+                    }
+                    for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
+                        const auto& map       = tagMapRef.get();
+                        const auto  nToCheck  = std::min(nSeen, kDedupCapacity);
+                        bool        duplicate = false;
+                        for (std::size_t j = 0; j < nToCheck; ++j) {
+                            if (seen[j].first == relIndex && *seen[j].second == map) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (!duplicate) {
+                            publishFiltered(relIndex, map);
+                            if (nSeen < kDedupCapacity) {
+                                seen[nSeen] = {relIndex, &map};
+                            }
+                            ++nSeen;
+                        }
+                    }
+                },
+                inputSpans);
+        }
+    }
+
+    /// apply settings from per-port input tags and update PortMetaInfo — no merge, no intermediate storage
+    template<typename TInputSpans>
+    void applyInputTagsFromPorts(TInputSpans& inputSpans, std::size_t untilLocalIndex = 1UZ) noexcept {
+        const std::size_t tagWindow = backwardTagPropagation ? untilLocalIndex : 1UZ;
+
+        for_each_reader_span(
+            [this, tagWindow](auto& in) {
+                if (!in.isSync || !in.isConnected) {
+                    return;
+                }
+                for (const auto& [relIndex, tagMapRef] : in.tags(tagWindow)) {
+                    settings().autoUpdate(Tag{relIndex < 0 ? 0UZ : static_cast<std::size_t>(relIndex), tagMapRef.get()});
+                }
+            },
+            inputSpans);
+
         for_each_port_and_reader_span(
-            [this, &untilLocalIndexAdjusted, isIndexEqual, isIndexAndMapEqual]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) { //
-                auto inTags = span.tags(untilLocalIndexAdjusted) | PairDeduplicateView(isIndexEqual, isIndexAndMapEqual);
-                for (const auto& [_, tagMap] : inTags) {
-                    emitErrorMessageIfAny("Block::updateMergedInputTagAndApplySettings", port.metaInfo.update(tagMap.get()));
+            [this, tagWindow]<PortLike TPort, ReaderSpanLike TReaderSpan>(TPort& port, TReaderSpan& span) {
+                for (const auto& [_, tagMapRef] : span.tags(tagWindow)) {
+                    emitErrorMessageIfAny("Block::applyInputTagsFromPorts", port.metaInfo.update(tagMapRef.get()));
                 }
             },
             inputPorts<PortType::STREAM>(&self()), inputSpans);
     }
 
-    void applyChangedSettings() {
+    void applyChangedSettings(bool publishForwardTags = true, property_map* capturedForwardParams = nullptr) {
         if (!settings().changed()) {
             return;
         }
-        invokeUserProvidedFunction("applyChangedSettings()", [this] noexcept(false) {
+        invokeUserProvidedFunction("applyChangedSettings()", [this, publishForwardTags, capturedForwardParams] noexcept(false) {
+            std::ignore      = publishForwardTags;
+            std::ignore      = capturedForwardParams;
             auto applyResult = settings().applyStagedParameters();
-            checkBlockParameterConsistency();
+            if constexpr (gr::meta::kDebugBuild) {
+                checkBlockParameterConsistency();
+            }
 
-            auto& forwardParametersMap = applyResult.forwardParameters;
-            if (!forwardParametersMap.empty()) {
-                for (auto& [key, value] : forwardParametersMap) {
-                    _mergedInputTag.insert_or_assign(convert_string_domain(key), value);
+            if constexpr (!noTagPropagation) {
+                if (publishForwardTags && !applyResult.forwardParameters.empty()) {
+                    if (capturedForwardParams) {
+                        capturedForwardParams->merge(std::move(applyResult.forwardParameters));
+                    } else {
+                        publishTag(applyResult.forwardParameters, 0);
+                    }
                 }
+            } else {
+                std::ignore = publishForwardTags;
+                std::ignore = capturedForwardParams;
             }
 
             settings().setChanged(false);
@@ -1188,12 +1276,12 @@ public:
                     if constexpr (std::remove_cvref_t<Port>::kIsInput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
                             if constexpr (std::remove_cvref_t<Port>::isOptional()) { // handle unconnected Optional ports: request 0 samples (like async)
-                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagForwarding>(port.isConnected() ? nSyncSamples : 0UZ);
+                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagPropagation>(port.isConnected() ? nSyncSamples : 0UZ);
                             } else {
-                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagForwarding>(nSyncSamples);
+                                return std::forward<Port>(port).template get<ProcessAll, !backwardTagPropagation>(nSyncSamples);
                             }
                         } else {
-                            return std::forward<Port>(port).template get<ProcessNone, !backwardTagForwarding>(port.streamReader().available());
+                            return std::forward<Port>(port).template get<ProcessNone, !backwardTagPropagation>(port.streamReader().available());
                         }
                     } else if constexpr (std::remove_cvref_t<Port>::kIsOutput) {
                         if constexpr (std::remove_cvref_t<Port>::kIsSynch) {
@@ -1215,31 +1303,31 @@ public:
             ports);
     }
 
-    inline constexpr void publishTag(property_map&& tag_data, std::size_t tagOffset = 0UZ) noexcept { processPublishTag(std::move(tag_data), tagOffset); }
-
-    inline constexpr void publishTag(const property_map& tag_data, std::size_t tagOffset = 0UZ) noexcept { processPublishTag(tag_data, tagOffset); }
-
+    /// publish a tag — in processOne dispatch: defers to dispatch loop for correct positioning; otherwise writes to ports directly
     template<PropertyMapType PropertyMap>
-    inline constexpr void processPublishTag(PropertyMap&& tagData, std::size_t tagOffset) noexcept {
-        if (_outputTags.empty()) {
-            _outputTags.emplace_back(Tag(tagOffset, std::forward<PropertyMap>(tagData)));
-        } else {
-            auto& lastTag = _outputTags.back();
-#ifndef NDEBUG
-            if (lastTag.index > tagOffset) { // check the order of published Tags.index
-                std::println(stderr, "{}::processPublishTag() - Tag indices are not in the correct order, lastTag.index:{}, index:{}", this->name, lastTag.index, tagOffset);
-                // std::abort();
-            }
-#endif
-            if (lastTag.index == tagOffset) { // -> merge tags with the same index
-                auto& lastTagMap = lastTag.map;
-                for (auto&& [key, value] : tagData) {
-                    lastTagMap.insert_or_assign(std::forward<decltype(key)>(key), std::forward<decltype(value)>(value));
-                }
+    inline constexpr void publishTag(PropertyMap&& tagData, std::size_t tagOffset = 0UZ) noexcept {
+        if (_inProcessOneDispatch) {
+            _outputTagPending = true;
+            if (_pendingOutputTag.empty()) {
+                _pendingOutputTag = property_map(std::forward<PropertyMap>(tagData));
             } else {
-                _outputTags.emplace_back(Tag(tagOffset, std::forward<PropertyMap>(tagData)));
+                for (auto&& [k, v] : tagData) {
+                    _pendingOutputTag.insert_or_assign(k, std::forward<decltype(v)>(v));
+                }
             }
+        } else {
+            for_each_port([&tagData, tagOffset](PortLike auto& outPort) { outPort.publishTag(tagData, tagOffset); }, outputPorts<PortType::STREAM>(&self()));
         }
+    }
+
+    /// pre-computed merged tag from all sync input ports at relIndex 0 — returns once, then empty (processOne only)
+    [[nodiscard]] constexpr bool inputTagsPresent() const noexcept { return _inputTagPresent; }
+
+    [[nodiscard]] const Tag& mergedInputTag() noexcept
+    requires(HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>)
+    {
+        _inputTagPresent = false;
+        return _mergedInputTag;
     }
 
     inline constexpr void publishEoS() noexcept {
@@ -1253,6 +1341,24 @@ public:
     }
 
     constexpr void requestStop() noexcept { emitErrorMessageIfAny("requestStop()", this->changeStateTo(lifecycle::State::REQUESTED_STOP)); }
+
+    [[nodiscard]] constexpr std::pmr::polymorphic_allocator<> allocator() const noexcept { return std::pmr::polymorphic_allocator<>{_allocResource}; }
+
+    [[nodiscard]] constexpr std::pmr::memory_resource* resource() const noexcept { return _allocResource; }
+
+    void rebindFieldsTo(std::pmr::memory_resource* mr) {
+        _allocResource = mr;
+        refl::for_each_data_member_index<Derived>([this, mr](auto kIdx) {
+            auto& field     = refl::data_member<kIdx>(self());
+            using F         = std::remove_cvref_t<decltype(field)>;
+            using Unwrapped = unwrap_if_wrapped_t<F>;
+            if constexpr (gr::PmrMigratable<F>) {
+                gr::migrateField(field, mr);
+            } else if constexpr (is_annotated<F>() && gr::PmrMigratable<Unwrapped>) {
+                gr::migrateField(field.value, mr);
+            }
+        });
+    }
 
     constexpr void processScheduledMessages() {
         using namespace std::chrono;
@@ -1285,407 +1391,6 @@ public:
         for_each_port(processPort, inputPorts<PortType::MESSAGE>(&self()));
     }
 
-protected:
-    std::optional<Message> propertyCallbackHeartbeat(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kHeartbeat);
-
-        if (message.cmd == Set || message.cmd == Get) {
-            std::uint64_t nanoseconds_count = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-            message.data                    = pmt::Value::Map{{"heartbeat", nanoseconds_count}};
-            return message;
-        } else if (message.cmd == Subscribe) {
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        } else if (message.cmd == Unsubscribe) {
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackEcho(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kEcho);
-
-        if (message.cmd == Set) {
-            return message; // mirror message as is
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackLifecycleState(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kLifeCycleState);
-
-        if (message.cmd == Set) {
-            if (!message.data.has_value() || !message.data.value().contains("state")) { // Changed '&&' to '||'
-                throw gr::exception(std::format("propertyCallbackLifecycleState - cannot set block state w/o 'state' data msg: {}", message));
-            }
-
-            const auto& dataMap = message.data.value(); // Introduced const auto& dataMap
-            auto        it      = dataMap.find("state");
-            if (it == dataMap.end()) {
-                throw gr::exception(std::format("propertyCallbackLifecycleState - state not found, msg: {}", message));
-            }
-
-            const auto stateStr = it->second.value_or(std::string_view{});
-            if (!stateStr.data()) {
-                throw gr::exception(std::format("propertyCallbackLifecycleState - state is not a string, msg: {}", message));
-            }
-
-            auto state = magic_enum::enum_cast<lifecycle::State>(stateStr); // Changed to dereference stateStr
-            if (!state.has_value()) {
-                throw gr::exception(std::format("propertyCallbackLifecycleState - invalid lifecycle::State conversion from {}, msg: {}", stateStr, message));
-            }
-
-            if (auto e = this->changeStateTo(state.value()); !e) {
-                throw gr::exception(std::format("propertyCallbackLifecycleState - error in state transition - what: {}", e.error().message, e.error().sourceLocation, e.error().errorTime));
-            }
-
-            return std::nullopt;
-        }
-
-        if (message.cmd == Get) { // Merged 'else if' with 'if'
-            message.data = pmt::Value::Map{{"state", std::string(magic_enum::enum_name(this->state()))}};
-            return message;
-        }
-
-        if (message.cmd == Subscribe) { // Merged 'else if' with 'if'
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        }
-
-        if (message.cmd == Unsubscribe) { // Merged 'else if' with 'if'
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("propertyCallbackLifecycleState - does not implement command {}, msg: {}", message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackSettings(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kSetting);
-
-        if (message.cmd == Set) {
-            if (!message.data.has_value()) {
-                throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", unique_name, name, propertyName, message));
-            }
-            // delegate to 'propertyCallbackStagedSettings' since we cannot set but only stage new settings due to mandatory real-time/non-real-time decoupling
-            // settings are applied during the next work(...) invocation.
-            propertyCallbackStagedSettings(block::property::kStagedSetting, message);
-            return std::nullopt;
-        } else if (message.cmd == Get) {
-            message.data = self().settings().get();
-            return message;
-        } else if (message.cmd == Subscribe) {
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        } else if (message.cmd == Unsubscribe) {
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackStagedSettings(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kStagedSetting);
-        const auto keys = [](const property_map& map) noexcept {
-            std::string result;
-            for (const auto& pair : map) {
-                if (!result.empty()) {
-                    result += ", ";
-                }
-                result += pair.first;
-            }
-            return result;
-        };
-
-        if (message.cmd == Set) {
-            if (!message.data.has_value()) {
-                throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", unique_name, name, propertyName, message));
-            }
-
-            property_map notSet          = self().settings().setStaged(*message.data);
-            property_map stagedParameter = self().settings().stagedParameters();
-
-            if (notSet.empty()) {
-                if (!message.clientRequestID.empty()) {
-                    message.cmd  = Final;
-                    message.data = std::move(stagedParameter);
-                    return message;
-                }
-                return std::nullopt;
-            }
-
-            throw gr::exception(std::format("propertyCallbackStagedSettings - could not set fields: {}\nvs. available: {}", keys(std::move(notSet)), keys(settings().get())));
-        } else if (message.cmd == Get) {
-            message.data = self().settings().stagedParameters();
-            return message;
-        } else if (message.cmd == Subscribe) {
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        } else if (message.cmd == Unsubscribe) {
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackStoreDefaults(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kStoreDefaults);
-
-        if (message.cmd == Set) {
-            settings().storeDefaults();
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackResetDefaults(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kResetDefaults);
-
-        if (message.cmd == Set) {
-            settings().resetDefaults();
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackActiveContext(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kActiveContext);
-
-        if (message.cmd == Set) {
-            if (!message.data.has_value()) {
-                throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", unique_name, name, propertyName, message));
-            }
-
-            const auto& dataMap = message.data.value(); // Introduced const auto& dataMap
-
-            std::string contextStr;
-            if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
-                if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
-                    contextStr = str;
-                } else {
-                    throw gr::exception(std::format("propertyCallbackActiveContext - context is not a string, msg: {}", message));
-                }
-            } else {
-                throw gr::exception(std::format("propertyCallbackActiveContext - context name not found, msg: {}", message));
-            }
-
-            std::uint64_t time = 0;
-            if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
-                if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
-                    time = *timePtr;
-                }
-            }
-
-            auto ctx = settings().activateContext(SettingsCtx{
-                .time    = time,
-                .context = contextStr,
-            });
-
-            if (!ctx.has_value()) {
-                throw gr::exception(std::format("propertyCallbackActiveContext - failed to activate context {}, msg: {}", contextStr, message));
-            }
-        }
-
-        if (message.cmd == Get || message.cmd == Set) {
-            const auto& ctx = settings().activeContext();
-            message.data    = property_map{
-                   {gr::tag::CONTEXT.shortKey(), ctx.context},  //
-                   {gr::tag::CONTEXT_TIME.shortKey(), ctx.time} //
-            };
-            return message;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackSettingsCtx(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kSettingsCtx);
-
-        if (!message.data.has_value()) {
-            throw gr::exception(std::format("block {} (aka. {}) cannot get/set {} w/o data msg: {}", unique_name, name, propertyName, message));
-        }
-
-        const auto& dataMap = message.data.value(); // Introduced const auto& dataMap
-
-        std::string contextStr;
-        if (auto it = dataMap.find(gr::tag::CONTEXT.shortKey()); it != dataMap.end()) {
-            if (const auto str = it->second.value_or(std::string_view{}); str.data()) {
-                contextStr = str;
-            } else {
-                throw gr::exception(std::format("propertyCallbackSettingsCtx - context is not a string, msg: {}", message));
-            }
-        } else {
-            throw gr::exception(std::format("propertyCallbackSettingsCtx - context name not found, msg: {}", message));
-        }
-
-        std::uint64_t time = 0;
-        if (auto it = dataMap.find(gr::tag::CONTEXT_TIME.shortKey()); it != dataMap.end()) {
-            if (const std::uint64_t* timePtr = it->second.get_if<std::uint64_t>(); timePtr) {
-                time = *timePtr;
-            }
-        }
-
-        SettingsCtx ctx{
-            .time    = time,
-            .context = contextStr,
-        };
-
-        pmt::Value::Map parameters;
-        if (message.cmd == Get) {
-            Tensor<pmt::Value> paramKeys;
-            auto               itParam = dataMap.find("parameters");
-            if (itParam != dataMap.end()) {
-                auto keys = itParam->second.get_if<Tensor<pmt::Value>>();
-                if (keys) {
-                    paramKeys = *keys;
-                } else {
-                    std::println("Warning: keys are not Tensor<Value>");
-                }
-            }
-
-            auto paramKeyStrings =                                                                                                                         //
-                paramKeys | std::views::transform([](const auto& keyValue) { return keyValue.value_or(std::string()); }) | std::ranges::to<std::vector>(); //
-            if (auto params = settings().getStored(paramKeyStrings, ctx); params.has_value()) {
-                parameters = params.value();
-            }
-            message.data = pmt::Value::Map{{"parameters", parameters}};
-            return message;
-        }
-
-        if (message.cmd == Set) {
-            if (auto it = dataMap.find("parameters"); it != dataMap.end()) {
-                auto params = it->second.get_if<pmt::Value::Map>();
-                if (params) {
-                    parameters = *params;
-                }
-            }
-
-            message.data = property_map{{"failed_to_set", settings().set(parameters, ctx)}};
-            return message;
-        }
-
-        // Removed a Context
-        if (message.cmd == Disconnect) {
-            auto str = ctx.context.value_or(std::string_view{});
-            if (str.empty()) {
-                throw gr::exception(std::format("propertyCallbackSettingsCtx - cannot delete default context, msg: {}", message));
-            }
-
-            if (!settings().removeContext(ctx)) {
-                throw gr::exception(std::format("propertyCallbackSettingsCtx - could not delete context {}, msg: {}", ctx.context, message));
-            }
-            return message;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackSettingsContexts(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kSettingsContexts);
-
-        if (message.cmd == Get) {
-            const std::map<pmt::Value, std::vector<SettingsBase::CtxSettingsPair>, settings::PMTCompare>& stored = settings().getStoredAll();
-
-            Tensor<pmt::Value>    contexts;
-            Tensor<std::uint64_t> times;
-            for (const auto& [ctxName, ctxParameters] : stored) {
-                for (const auto& [ctx, properties] : ctxParameters) {
-                    if (!ctx.context.holds<std::string>()) {
-                        continue;
-                    }
-                    const auto str = ctx.context.value_or(std::string_view{});
-                    contexts.push_back(str);
-                    times.push_back(ctx.time);
-                }
-            }
-
-            message.data = pmt::Value::Map{
-                {"contexts", std::move(contexts)},
-                {"times", std::move(times)},
-            };
-            return message;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackMetaInformation(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kMetaInformation);
-
-        if (message.cmd == Set) {
-            throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-            return std::nullopt;
-        } else if (message.cmd == Get) {
-            message.data = self().meta_information.value; // get
-            return message;
-        } else if (message.cmd == Subscribe) {
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        } else if (message.cmd == Unsubscribe) {
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-    std::optional<Message> propertyCallbackUiConstraints(std::string_view propertyName, Message message) {
-        using enum gr::message::Command;
-        assert(propertyName == block::property::kUiConstraints);
-
-        if (message.cmd == Set) {
-            if (!message.data.has_value()) {
-                throw gr::exception(std::format("block {} (aka. {}) cannot set {} w/o data msg: {}", unique_name, name, propertyName, message));
-            }
-            // delegate to 'propertyCallbackStagedSettings' since we cannot set but only stage new settings due to mandatory real-time/non-real-time decoupling
-            // settings are applied during the next work(...) invocation.
-            propertyCallbackStagedSettings(block::property::kStagedSetting, message);
-            return std::nullopt;
-        } else if (message.cmd == Get) {                // only return ui_constraints
-            message.data = self().ui_constraints.value; // get
-            return message;
-        } else if (message.cmd == Subscribe) {
-            if (!message.clientRequestID.empty()) {
-                propertySubscriptions[std::string(propertyName)].insert(message.clientRequestID);
-            }
-            return std::nullopt;
-        } else if (message.cmd == Unsubscribe) {
-            propertySubscriptions[std::string(propertyName)].erase(message.clientRequestID);
-            return std::nullopt;
-        }
-
-        throw gr::exception(std::format("block {} property {} does not implement command {}, msg: {}", unique_name, propertyName, message.cmd, message));
-    }
-
-protected:
     /***
      * Aggregate the amount of samples that can be consumed/produced from a range of ports.
      * @param ports a typelist of input or output ports
@@ -1721,6 +1426,7 @@ protected:
     auto getNextTagAndEosPosition() {
         struct {
             bool        hasTag     = false;
+            bool        hasAnyTag  = false; // true if any tag exists in the tag buffer (not just at current position)
             std::size_t nextTag    = std::numeric_limits<std::size_t>::max();
             std::size_t nextEosTag = std::numeric_limits<std::size_t>::max();
             bool        asyncEoS   = false;
@@ -1734,6 +1440,7 @@ protected:
                     result.nextTag                    = std::min(result.nextTag, nSamplesUntilNextTag(port, 1).value_or(std::numeric_limits<std::size_t>::max()));
                     result.nextEosTag                 = std::min(result.nextEosTag, samples_to_eos_tag(port).value_or(std::numeric_limits<std::size_t>::max()));
                     const ReaderSpanLike auto tagData = port.tagReader().get();
+                    result.hasAnyTag                  = result.hasAnyTag || !tagData.empty();
                     result.hasTag                     = result.hasTag || (!tagData.empty() && tagData[0].index == port.streamReader().position() && !tagData[0].map.empty());
                 } else { // async port
                     if (samples_to_eos_tag(port).transform([&port](auto n) { return n <= port.min_samples; }).value_or(false)) {
@@ -1846,37 +1553,42 @@ protected:
     std::size_t getMergedBlockLimit() {
         if constexpr (Derived::blockCategory != block::Category::NormalBlock) {
             return 0UZ;
-        } else if constexpr (requires(const Derived& d) {
-                                 { available_samples(d) } -> std::same_as<std::size_t>;
-                             }) {
-            return available_samples(self());
         } else if constexpr (traits::block::stream_input_port_types<Derived>::size == 0UZ     // allow blocks that have neither input nor output ports
                              && traits::block::stream_output_port_types<Derived>::size == 0UZ // (by merging source to sink block) -> use internal buffer size
                              && requires { Derived::merged_work_chunk_size(); }) {            //
-            constexpr gr::Size_t chunkSize = Derived::merged_work_chunk_size();
-            static_assert(chunkSize != std::dynamic_extent && chunkSize > 0, "At least one internal port must define a maximum number of samples or the non-member/hidden "
-                                                                             "friend function `available_samples(const BlockType&)` must be defined.");
+            constexpr gr::Size_t chunkSize = static_cast<gr::Size_t>(Derived::merged_work_chunk_size());
+            static_assert(chunkSize != std::dynamic_extent && chunkSize > 0, "At least one internal port must define a maximum number of samples.");
             return chunkSize;
         } else {
             return std::numeric_limits<std::size_t>::max();
         }
     }
 
-    template<typename TIn, typename TOut>
-    gr::work::Status invokeProcessBulk(TIn& inputReaderTuple, TOut& outputReaderTuple) {
+    template<typename Fn, typename TIn, typename TOut>
+    gr::work::Status invokeBulkDispatch(Fn&& fn, TIn& inputReaderTuple, TOut& outputReaderTuple) {
         auto tempInputSpanStorage = std::apply(
             []<typename... PortReader>(PortReader&... args) {
                 return std::tuple{([](auto& a) {
                     if constexpr (gr::meta::array_or_vector_type<PortReader>) {
                         return std::span{a.data(), a.size()};
                     } else {
-                        return a;
+                        return std::move(a);
                     }
                 }(args))...};
             },
             inputReaderTuple);
 
-        auto tempOutputSpanStorage = std::apply([]<typename... PortReader>(PortReader&... args) { return std::tuple{(gr::meta::array_or_vector_type<PortReader> ? std::span{args.data(), args.size()} : args)...}; }, outputReaderTuple);
+        auto tempOutputSpanStorage = std::apply(
+            []<typename... PortReader>(PortReader&... args) {
+                return std::tuple{([](auto& a) {
+                    if constexpr (gr::meta::array_or_vector_type<std::remove_cvref_t<decltype(a)>>) {
+                        return std::span{a.data(), a.size()};
+                    } else {
+                        return std::move(a);
+                    }
+                }(args))...};
+            },
+            outputReaderTuple);
 
         auto refToSpan = []<typename T, typename U>(T&& original, U&& temporary) -> decltype(auto) {
             if constexpr (gr::meta::array_or_vector_type<std::decay_t<T>>) {
@@ -1886,18 +1598,28 @@ protected:
             }
         };
 
-        return [&]<std::size_t... InIdx, std::size_t... OutIdx>(std::index_sequence<InIdx...>, std::index_sequence<OutIdx...>) { return self().processBulk(refToSpan(std::get<InIdx>(inputReaderTuple), std::get<InIdx>(tempInputSpanStorage))..., refToSpan(std::get<OutIdx>(outputReaderTuple), std::get<OutIdx>(tempOutputSpanStorage))...); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<decltype(inputReaderTuple)>>>(), std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<decltype(outputReaderTuple)>>>());
+        return [&]<std::size_t... InIdx, std::size_t... OutIdx>(std::index_sequence<InIdx...>, std::index_sequence<OutIdx...>) { return fn(refToSpan(std::get<InIdx>(inputReaderTuple), std::get<InIdx>(tempInputSpanStorage))..., refToSpan(std::get<OutIdx>(outputReaderTuple), std::get<OutIdx>(tempOutputSpanStorage))...); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<decltype(inputReaderTuple)>>>(), std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<decltype(outputReaderTuple)>>>());
+    }
+
+    template<typename TIn, typename TOut>
+    gr::work::Status invokeProcessBulk(TIn& inputReaderTuple, TOut& outputReaderTuple) {
+        return invokeBulkDispatch([this](auto&... args) { return self().processBulk(args...); }, inputReaderTuple, outputReaderTuple);
+    }
+
+    template<typename TIn, typename TOut>
+    gr::work::Status invokeProcessEpilogue(TIn& inputReaderTuple, TOut& outputReaderTuple) {
+        return invokeBulkDispatch([this](auto&... args) { return self().processEpilogue(args...); }, inputReaderTuple, outputReaderTuple);
     }
 
     work::Status invokeProcessOneSimd(auto& inputSpans, auto& outputSpans, auto width, std::size_t nSamplesToProcess) {
         std::size_t i = 0UZ;
         for (; i + width <= nSamplesToProcess; i += width) {
-            const auto& results = simdize_tuple_load_and_apply(width, inputSpans, i, [&](const auto&... input_simds) { return invoke_processOne_simd(width, input_simds...); });
+            const auto& results = simdize_tuple_load_and_apply(width, inputSpans, i, [this, width](const auto&... input_simds) { return this->invoke_processOne_simd(width, input_simds...); });
             meta::tuple_for_each([i](auto& output_range, const auto& result) { result.copy_to(output_range.data() + i, stdx::element_aligned); }, outputSpans, results);
         }
-        simd_epilogue(width, [&](auto w) {
+        simd_epilogue(width, [this, &i, &nSamplesToProcess, &inputSpans, &outputSpans](auto w) {
             if (i + w <= nSamplesToProcess) {
-                const auto results = simdize_tuple_load_and_apply(w, inputSpans, i, [&](auto&&... input_simds) { return invoke_processOne_simd(w, input_simds...); });
+                const auto results = simdize_tuple_load_and_apply(w, inputSpans, i, [this, w](auto&&... input_simds) { return this->invoke_processOne_simd(w, input_simds...); });
                 meta::tuple_for_each([i](auto& output_range, auto& result) { result.copy_to(output_range.data() + i, stdx::element_aligned); }, outputSpans, results);
                 i += w;
             }
@@ -1922,6 +1644,7 @@ protected:
             std::size_t  processedOut;
         };
 
+        _inProcessOneDispatch                      = true;
         std::size_t nOutSamplesBeforeRequestedStop = 0UZ;
         for (std::size_t i = 0UZ; i < nSamplesToProcess; ++i) {
             auto results = std::apply([this, i](auto&... inputs) { return this->invoke_processOne(inputs[i]...); }, inputSpans);
@@ -1937,13 +1660,19 @@ protected:
                 },
                 outputSpans, results);
             nOutSamplesBeforeRequestedStop++;
-            // the block implementer can set `_outputTagsChanged` to true in `processOne` to prematurely leave the loop and apply his changes
-            if (_outputTagsChanged || lifecycle::isShuttingDown(this->state())) [[unlikely]] { // emitted tag and/or requested to stop
+            if (_outputTagPending) [[unlikely]] {
+                for_each_writer_span([this, i](auto& out) { out.publishTag(_pendingOutputTag, i); }, outputSpans);
+                _pendingOutputTag.clear();
+                _outputTagPending = false;
+                break;
+            }
+            if (lifecycle::isShuttingDown(this->state())) [[unlikely]] {
                 break;
             }
         }
-        _outputTagsChanged = false;
-        return ProcessOneResult{lifecycle::isShuttingDown(this->state()) ? DONE : OK, nSamplesToProcess, std::min(nSamplesToProcess, nOutSamplesBeforeRequestedStop)};
+        _inProcessOneDispatch = false;
+        const auto nProcessed = std::min(nSamplesToProcess, nOutSamplesBeforeRequestedStop);
+        return ProcessOneResult{lifecycle::isShuttingDown(this->state()) ? DONE : OK, nProcessed, nProcessed};
     }
 
     [[nodiscard]] bool hasNoDownStreamConnectedChildren() const noexcept {
@@ -2023,7 +1752,6 @@ protected:
      *     - check whether there are available samples for any ASYNC port
      *     - limit to requestedWork
      *     - correctly consider Resampling and Stride
-     *     - deprecated: available_samples limits the amount of work to produce for source blocks
      * - perform work: processBulk/One/SIMD
      * - publishing
      *   - publish tags (done first so tags are guaranteed to be fully published for all available samples)
@@ -2032,95 +1760,12 @@ protected:
      * @return struct { std::size_t produced_work, work_return_t}
      */
 
-    work::Result workInternal(std::size_t requestedWork)
-    requires(Derived::blockCategory == block::Category::NormalBlock)
-    {
+    template<typename TInputSpans, typename TOutputSpans>
+    work::Status dispatchProcessing(TInputSpans& inputSpans, TOutputSpans& outputSpans, std::size_t& processedIn, std::size_t& processedOut) {
         using enum gr::work::Status;
-        using TInputTypes  = traits::block::stream_input_port_types<Derived>;
-        using TOutputTypes = traits::block::stream_output_port_types<Derived>;
+        using TInputTypes = traits::block::stream_input_port_types<Derived>;
 
-        applyChangedSettings(); // apply settings even if the block is already stopped
-
-        if constexpr (!blockingIO) { // N.B. no other thread/constraint to consider before shutting down
-            if (this->state() == lifecycle::State::REQUESTED_STOP) {
-                emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
-            }
-        }
-
-        if constexpr (TOutputTypes::size.value > 0UZ) {
-            if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
-                this->requestStop(); // no dependent non-optional children, should stop processing
-            }
-        }
-
-        if (this->state() == lifecycle::State::STOPPED) {
-            disconnectFromUpStreamParents();
-            return {requestedWork, 0UZ, DONE};
-        }
-
-        // TODO: finally remove me
-        // const auto [minSyncIn, maxSyncIn, maxSyncAvailableIn, hasAsyncIn] = getPortLimits(inputPorts<PortType::STREAM>(&self()));
-        // const auto [minSyncOut, maxSyncOut, maxSyncAvailableOut, hasAsyncOut] = getPortLimits(outputPorts<PortType::STREAM>(&self()));
-
-        on_scope_exit _cacheGuard = [&] {
-            inputStreamCache.invalidateStatistic();
-            outputStreamCache.invalidateStatistic();
-        };
-        std::size_t minSyncIn           = inputStreamCache.minSyncRequirement();
-        std::size_t maxSyncIn           = inputStreamCache.maxSyncRequirement();
-        std::size_t maxSyncAvailableIn  = inputStreamCache.maxSyncAvailable();
-        bool        hasAsyncIn          = inputStreamCache.hasASyncAvailable();
-        std::size_t minSyncOut          = outputStreamCache.minSyncRequirement();
-        std::size_t maxSyncOut          = outputStreamCache.maxSyncRequirement();
-        std::size_t maxSyncAvailableOut = outputStreamCache.maxSyncAvailable();
-        bool        hasAsyncOut         = outputStreamCache.hasASyncAvailable();
-
-        auto [hasTag, nextTag, nextEosTag, asyncEoS]      = getNextTagAndEosPosition();
-        std::size_t maxChunk                              = getMergedBlockLimit(); // handle special cases for merged blocks. TODO: evaluate if/how we can get rid of these
-        const auto  inputSkipBefore                       = inputSamplesToSkipBeforeNextChunk(std::min({maxSyncAvailableIn, nextTag, nextEosTag}));
-        const auto  nextTagLimit                          = (nextTag - inputSkipBefore) >= minSyncIn ? (nextTag - inputSkipBefore) : std::numeric_limits<std::size_t>::max();
-        const auto  ensureMinimalDecimation               = nextTagLimit >= input_chunk_size ? nextTagLimit : static_cast<long unsigned int>(input_chunk_size); // ensure to process at least one input_chunk_size (may shift tags)
-        const auto  availableToProcess                    = std::min({maxSyncIn, maxChunk, (maxSyncAvailableIn - inputSkipBefore), ensureMinimalDecimation, (nextEosTag - inputSkipBefore)});
-        const auto  availableToPublish                    = std::min({maxSyncOut, maxSyncAvailableOut});
-        auto [resampledIn, resampledOut, resampledStatus] = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
-        const auto nextEosTagSkipBefore                   = nextEosTag - inputSkipBefore;
-        const bool isEosTagPresent                        = nextEosTag <= 0 || nextEosTagSkipBefore < minSyncIn || nextEosTagSkipBefore < input_chunk_size || output_chunk_size * (nextEosTagSkipBefore / input_chunk_size) < minSyncOut;
-
-        if (inputSkipBefore > 0) {                                                                    // consume samples on sync ports that need to be consumed due to the stride
-            auto inputSpans = prepareStreams(inputPorts<PortType::STREAM>(&self()), inputSkipBefore); // only way to consume is via the ReaderSpanLike now
-            updateMergedInputTagAndApplySettings(inputSpans, inputSkipBefore);                        // apply all tags in the skipped data range
-            consumeReaders(inputSkipBefore, inputSpans);
-        }
-        // return if there is no work to be performed // todo: add eos policy
-        if (isEosTagPresent || lifecycle::isShuttingDown(this->state()) || asyncEoS) {
-            emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
-            publishEoS();
-            this->setAndNotifyState(lifecycle::State::STOPPED);
-            return {requestedWork, 0UZ, DONE};
-        }
-
-        if (resampledIn == 0 && resampledOut == 0 && !hasAsyncIn && !hasAsyncOut) {
-            return {requestedWork, 0UZ, resampledStatus};
-        }
-
-        // for non-bulk processing, the processed span has to be limited to the first sample if it contains a tag s.t. the tag is not applied to every sample
-        const bool limitByFirstTag = (!HasProcessBulkFunction<Derived> && HasProcessOneFunction<Derived>) && hasTag;
-
-        // call the block implementation's work function
-        work::Status userReturnStatus = ERROR; // default if nothing has been set
-        std::size_t  processedIn      = limitByFirstTag ? 1UZ : resampledIn;
-        std::size_t  processedOut     = limitByFirstTag ? 1UZ : resampledOut;
-
-        auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
-        auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
-
-        updateMergedInputTagAndApplySettings(inputSpans, processedIn);
-
-        applyChangedSettings();
-
-        // Actual publishing occurs when outputSpans go out of scope. If processedOut == 0, the Tags will not be published.
-        publishCachedOutputTags(outputSpans);
-        publishMergedInputTag(outputSpans);
+        work::Status userReturnStatus = ERROR;
 
         if constexpr (HasProcessBulkFunction<Derived>) {
             invokeUserProvidedFunction("invokeProcessBulk", [&userReturnStatus, &inputSpans, &outputSpans, this] noexcept(HasNoexceptProcessBulkFunction<Derived>) { userReturnStatus = invokeProcessBulk(inputSpans, outputSpans); });
@@ -2143,55 +1788,114 @@ protected:
 
         } else if constexpr (HasProcessOneFunction<Derived>) {
             if (processedIn != processedOut) {
-                emitErrorMessage("Block::workInternal:", std::format("N input samples ({}) does not equal to N output samples ({}) for processOne() method.", resampledIn, resampledOut));
+                emitErrorMessage("Block::workInternal:", std::format("N input samples ({}) does not equal to N output samples ({}) for processOne() method.", processedIn, processedOut));
                 requestStop();
                 processedIn  = 0;
                 processedOut = 0;
             } else {
-                constexpr bool        kIsSourceBlock = TInputTypes::size() == 0;
-                constexpr std::size_t kMaxWidth      = stdx::simd_abi::max_fixed_size<double>;
-                // A block determines it's simd::size() via its input types. However, a source block doesn't have any
-                // input types and therefore wouldn't be able to produce simd output on processOne calls. To overcome
-                // this limitation, a source block can implement `processOne_simd(vir::constexpr_value auto width)`
-                // instead of `processOne()` and then return simd objects with simd::size() == width.
-                constexpr bool kIsSimdSourceBlock = kIsSourceBlock and requires(Derived& d) { d.processOne_simd(vir::cw<kMaxWidth>); };
-                if constexpr (HasConstProcessOneFunction<Derived>) { // processOne is const -> can process whole batch similar to SIMD-ised call
-                    if constexpr (kIsSimdSourceBlock or traits::block::can_processOne_simd<Derived>) {
-                        // SIMD loop
-                        constexpr auto kWidth = [&] {
-                            if constexpr (kIsSourceBlock) {
-                                return vir::cw<kMaxWidth>;
-                            } else {
-                                return vir::cw<std::min(kMaxWidth, vir::simdize<typename TInputTypes::template apply<std::tuple>>::size() * std::size_t(4))>;
-                            }
-                        }();
+                constexpr bool        kIsSourceBlock     = TInputTypes::size() == 0;
+                constexpr std::size_t kMaxWidth          = stdx::simd_abi::max_fixed_size<double>;
+                constexpr bool        kIsSimdSourceBlock = kIsSourceBlock and requires(const Derived& d) { d.processOne(meta::cw<kMaxWidth>); }; // source blocks opt into SIMD via processOne(width)
+
+                if constexpr (kIsSimdSourceBlock) {
+                    constexpr auto kWidth = meta::cw<kMaxWidth>;
+                    invokeUserProvidedFunction("invokeProcessOneSimd", [&userReturnStatus, &inputSpans, &outputSpans, &kWidth, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOneSimd(inputSpans, outputSpans, kWidth, processedIn); });
+                } else if constexpr (HasConstProcessOneFunction<Derived>) {
+                    if constexpr (traits::block::can_processOne_simd<Derived>) {
+                        constexpr auto kWidth = meta::cw<std::min(kMaxWidth, meta::simdize<typename TInputTypes::template apply<std::tuple>>::size() * std::size_t(4))>;
                         invokeUserProvidedFunction("invokeProcessOneSimd", [&userReturnStatus, &inputSpans, &outputSpans, &kWidth, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOneSimd(inputSpans, outputSpans, kWidth, processedIn); });
-                    } else { // Non-SIMD loop
+                    } else {
                         invokeUserProvidedFunction("invokeProcessOnePure", [&userReturnStatus, &inputSpans, &outputSpans, &processedIn, this] noexcept(HasNoexceptProcessOneFunction<Derived>) { userReturnStatus = invokeProcessOnePure(inputSpans, outputSpans, processedIn); });
                     }
-                } else { // processOne isn't const i.e. not a pure function w/o side effects -> need to evaluate state
-                         // after each sample
-                    static_assert(not kIsSimdSourceBlock and not traits::block::can_processOne_simd<Derived>, "A non-const processOne function implies sample-by-sample processing, which is not compatible with SIMD arguments. Consider marking the function 'const' or using non-SIMD argument types.");
+                } else {
+                    static_assert(not traits::block::can_processOne_simd<Derived>, "A non-const processOne function implies sample-by-sample processing, which is not compatible with SIMD arguments. Consider marking the function 'const' or using non-SIMD argument types.");
                     const auto result = invokeProcessOneNonConst(inputSpans, outputSpans, processedIn);
                     userReturnStatus  = result.status;
                     processedIn       = result.processedIn;
                     processedOut      = result.processedOut;
                 }
             }
-        } else { // block does not define any valid processing function
+        } else {
             meta::print_types<meta::message_type<"neither processBulk(...) nor processOne(...) implemented for:">, Derived>{};
         }
 
-        // sanitise input/output samples based on explicit user-defined processBulk(...) return status
-        if (userReturnStatus == INSUFFICIENT_OUTPUT_ITEMS || userReturnStatus == INSUFFICIENT_INPUT_ITEMS || userReturnStatus == ERROR) {
-            processedIn  = 0UZ;
-            processedOut = 0UZ;
-        }
+        return userReturnStatus;
+    }
 
-        if (processedOut > 0) {
-            publishCachedOutputTags(outputSpans);
-            _mergedInputTag.map.clear(); // clear temporary cached input tags after processing - won't be needed after this
-        } else {
+    /// check lifecycle state — returns early Result if block should stop, nullopt if work should proceed
+    std::optional<work::Result> checkLifecycle(std::size_t requestedWork) {
+        using enum gr::work::Status;
+        using TOutputTypes = traits::block::stream_output_port_types<Derived>;
+
+        if (this->state() == lifecycle::State::REQUESTED_STOP) {
+            emitErrorMessageIfAny("workInternal(): REQUESTED_STOP -> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
+        }
+        if constexpr (TOutputTypes::size.value > 0UZ) {
+            if (disconnect_on_done && hasNoDownStreamConnectedChildren()) {
+                this->requestStop();
+            }
+        }
+        if (this->state() == lifecycle::State::STOPPED) {
+            // flush any staged settings before shutdown so messages that arrived just before
+            // the block transitioned to STOPPED (e.g. kSetting/ui_constraints) still commit
+            applyChangedSettings();
+            disconnectFromUpStreamParents();
+            return work::Result{requestedWork, 0UZ, DONE};
+        }
+        return std::nullopt;
+    }
+
+    /// compute available samples, tag positions, resampling, chunk limits
+    struct SampleLimits {
+        std::size_t  resampledIn{}, resampledOut{}, inputSkipBefore{};
+        work::Status resampledStatus = work::Status::OK;
+        bool         hasTag{}, hasAnyTag{}, asyncEoS{}, isEosPresent{};
+        bool         hasAsyncIn{}, hasAsyncOut{};
+    };
+
+    SampleLimits computeSampleLimits(std::size_t requestedWork) {
+        std::size_t minSyncIn           = inputStreamCache.minSyncRequirement();
+        std::size_t maxSyncIn           = inputStreamCache.maxSyncRequirement();
+        std::size_t maxSyncAvailableIn  = inputStreamCache.maxSyncAvailable();
+        bool        hasAsyncIn          = inputStreamCache.hasASyncAvailable();
+        std::size_t minSyncOut          = outputStreamCache.minSyncRequirement();
+        std::size_t maxSyncOut          = outputStreamCache.maxSyncRequirement();
+        std::size_t maxSyncAvailableOut = outputStreamCache.maxSyncAvailable();
+        bool        hasAsyncOut         = outputStreamCache.hasASyncAvailable();
+
+        auto [hasTag, hasAnyTag, nextTag, nextEosTag, asyncEoS] = getNextTagAndEosPosition();
+        if constexpr (forwardTagPropagation) {
+            nextTag = std::numeric_limits<std::size_t>::max(); // don't break chunks at tags — tags carry forward
+        }
+        std::size_t       maxChunk                        = getMergedBlockLimit();
+        const std::size_t inputSkipBefore                 = inputSamplesToSkipBeforeNextChunk(std::min({maxSyncAvailableIn, nextTag, nextEosTag}));
+        const std::size_t nextTagAfterSkip                = nextTag > inputSkipBefore ? nextTag - inputSkipBefore : 0UZ;
+        const std::size_t availAfterSkip                  = maxSyncAvailableIn > inputSkipBefore ? maxSyncAvailableIn - inputSkipBefore : 0UZ;
+        const std::size_t eosAfterSkip                    = nextEosTag > inputSkipBefore ? nextEosTag - inputSkipBefore : 0UZ;
+        const std::size_t nextTagLimit                    = nextTagAfterSkip >= minSyncIn ? nextTagAfterSkip : std::numeric_limits<std::size_t>::max();
+        const std::size_t ensureMinimalDecimation         = nextTagLimit >= input_chunk_size ? nextTagLimit : static_cast<std::size_t>(input_chunk_size);
+        const std::size_t availableToProcess              = std::min({maxSyncIn, maxChunk, availAfterSkip, ensureMinimalDecimation, eosAfterSkip});
+        const std::size_t availableToPublish              = std::min({maxSyncOut, maxSyncAvailableOut});
+        auto [resampledIn, resampledOut, resampledStatus] = computeResampling(std::min(minSyncIn, nextEosTag), availableToProcess, minSyncOut, availableToPublish, requestedWork);
+        const bool isEosPresent                           = nextEosTag <= 0 || eosAfterSkip < minSyncIn || eosAfterSkip < input_chunk_size || output_chunk_size * (eosAfterSkip / input_chunk_size) < minSyncOut;
+        return {.resampledIn = resampledIn, .resampledOut = resampledOut, .inputSkipBefore = inputSkipBefore, .resampledStatus = resampledStatus, .hasTag = hasTag, .hasAnyTag = hasAnyTag, .asyncEoS = asyncEoS, .isEosPresent = isEosPresent, .hasAsyncIn = hasAsyncIn, .hasAsyncOut = hasAsyncOut};
+    }
+
+    /// apply input tags and settings from all sync ports
+    template<typename TInputSpans>
+    void applyInputTagsAndSettings(TInputSpans& inputSpans, std::size_t processedIn, bool hasAnyTag) {
+        if (hasAnyTag) {
+            applyInputTagsFromPorts(inputSpans, processedIn);
+            applyChangedSettings(false);
+        }
+    }
+
+    /// publish tags and samples, consume inputs, handle EOS
+    template<typename TInputSpans, typename TOutputSpans>
+    void finaliseIO(TInputSpans& inputSpans, TOutputSpans& outputSpans, work::Status& userReturnStatus, std::size_t& processedIn, std::size_t processedOut, std::size_t resampledIn) {
+        using enum gr::work::Status;
+
+        if (processedOut == 0) {
             // if no data is published or consumed => do not publish any tags
             for_each_writer_span([](auto& outSpan) { outSpan.tagsPublished = 0; }, outputSpans);
         }
@@ -2225,34 +1929,122 @@ protected:
             this->setAndNotifyState(lifecycle::State::STOPPED);
             publishEoS(outputSpans);
         }
+    }
 
-        // check/sanitise return values (N.B. these are used by the scheduler as indicators
-        // whether and how much 'work' has been done to -- for example -- prioritise one block over another
-        std::size_t performedWork = 0UZ;
-        if (userReturnStatus == OK) {
-            constexpr bool kIsSourceBlock = traits::block::stream_input_port_types<Derived>::size == 0;
-            constexpr bool kIsSinkBlock   = traits::block::stream_output_port_types<Derived>::size == 0;
-            if constexpr (!kIsSourceBlock && !kIsSinkBlock) { // normal block with input(s) and output(s)
-                performedWork = processedIn;
-            } else if constexpr (kIsSinkBlock) {
-                performedWork = processedIn;
-            } else if constexpr (kIsSourceBlock) {
-                performedWork = processedOut;
-            } else {
-                performedWork = 1UZ;
-            }
+    work::Result workInternal(std::size_t requestedWork)
+    requires(Derived::blockCategory == block::Category::NormalBlock)
+    {
+        using enum gr::work::Status;
+        using TInputTypes = traits::block::stream_input_port_types<Derived>;
 
-            if (performedWork > 0UZ) {
-                progress->incrementAndGet();
+        if (std::optional<work::Result> earlyOut = checkLifecycle(requestedWork)) {
+            return *earlyOut;
+        }
+
+        on_scope_exit _cacheGuard = [&] {
+            inputStreamCache.invalidateStatistic();
+            outputStreamCache.invalidateStatistic();
+        };
+        property_map pendingForwardParams;
+        applyChangedSettings(true, &pendingForwardParams);
+        SampleLimits limits = computeSampleLimits(requestedWork);
+
+        if (limits.inputSkipBefore > 0) {
+            auto skipSpans = prepareStreams(inputPorts<PortType::STREAM>(&self()), limits.inputSkipBefore);
+            applyInputTagsFromPorts(skipSpans, limits.inputSkipBefore);
+            consumeReaders(limits.inputSkipBefore, skipSpans);
+        }
+
+        if (limits.isEosPresent || lifecycle::isShuttingDown(this->state()) || limits.asyncEoS) {
+            if constexpr (HasProcessEpilogueFunction<Derived>) {
+                inputStreamCache.invalidateStatistic();
+                const std::size_t trailing = inputStreamCache.maxSyncAvailable();
+                if (trailing > 0 && trailing != gr::undefined_size) {
+                    const std::size_t epilogueOutSize = std::max<std::size_t>((input_chunk_size > 0) ? (trailing * output_chunk_size + input_chunk_size - 1) / input_chunk_size : trailing, output_chunk_size);
+                    auto              epilogueIn      = prepareStreams(inputPorts<PortType::STREAM>(&self()), trailing);
+                    auto              epilogueOut     = prepareStreams(outputPorts<PortType::STREAM>(&self()), epilogueOutSize);
+                    invokeProcessEpilogue(epilogueIn, epilogueOut);
+                    publishSamples(0UZ, epilogueOut); // publish only what the block explicitly requested via out.publish(n)
+                    consumeReaders(trailing, epilogueIn);
+                }
             }
-            if constexpr (blockingIO) {
-                progress->notify_all();
+            emitErrorMessageIfAny("workInternal(): EOS tag arrived -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
+            publishEoS();
+            this->setAndNotifyState(lifecycle::State::STOPPED);
+            return {requestedWork, 0UZ, DONE};
+        }
+
+        if (limits.resampledIn == 0 && limits.resampledOut == 0 && !limits.hasAsyncIn && !limits.hasAsyncOut) {
+            if (!pendingForwardParams.empty()) {
+                std::ignore = settings().setStaged(pendingForwardParams); // re-stage for next work call
+            }
+            return {requestedWork, 0UZ, limits.resampledStatus};
+        }
+
+        std::size_t processedIn  = limits.resampledIn;
+        std::size_t processedOut = limits.resampledOut;
+
+        auto inputSpans  = prepareStreams(inputPorts<PortType::STREAM>(&self()), processedIn);
+        auto outputSpans = prepareStreams(outputPorts<PortType::STREAM>(&self()), processedOut);
+
+        applyChangedSettings(); // publishes any additional external settings changes via port fallback
+        applyInputTagsAndSettings(inputSpans, processedIn, limits.hasAnyTag);
+
+        if constexpr (requires { self().forwardTags(inputSpans, outputSpans, processedIn); }) {
+            self().forwardTags(inputSpans, outputSpans, processedIn);
+        } else {
+            forwardInputTags(inputSpans, outputSpans, processedIn);
+        }
+
+        if (!pendingForwardParams.empty()) {
+            for_each_writer_span([&pendingForwardParams](auto& out) { out.publishTag(pendingForwardParams, 0); }, outputSpans);
+        }
+
+        if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
+            bool hasTags = false;
+            for_each_reader_span([&hasTags](const auto& in) { hasTags = hasTags || (in.isSync && in.isConnected && !in.rawTags.empty()); }, inputSpans);
+            if (hasTags) {
+                property_map merged;
+                for_each_reader_span(
+                    [&merged](auto& in) {
+                        if (!in.isSync || !in.isConnected) {
+                            return;
+                        }
+                        for (const auto& [relIndex, tagMapRef] : in.tags()) {
+                            if (relIndex == 0) {
+                                for (const auto& [k, v] : tagMapRef.get()) {
+                                    merged.insert_or_assign(k, v);
+                                }
+                            }
+                        }
+                    },
+                    inputSpans);
+                if (!merged.empty()) {
+                    _mergedInputTag  = Tag{0UZ, std::move(merged)};
+                    _inputTagPresent = true;
+                }
             }
         }
-        return {requestedWork, performedWork, userReturnStatus};
-    } // end: work::Result workInternal(std::size_t requestedWork) { ... }
 
-public:
+        work::Status userReturnStatus = dispatchProcessing(inputSpans, outputSpans, processedIn, processedOut);
+
+        if constexpr (HasProcessOneFunction<Derived> && !HasProcessBulkFunction<Derived>) {
+            _inputTagPresent  = false;
+            _outputTagPending = false;
+            _pendingOutputTag.clear();
+            _inProcessOneDispatch = false;
+        }
+        work::sanitiseProcessStatus(userReturnStatus, processedIn, processedOut);
+        finaliseIO(inputSpans, outputSpans, userReturnStatus, processedIn, processedOut, limits.resampledIn);
+
+        constexpr bool kIsSourceBlock = TInputTypes::size.value == 0;
+        std::size_t    performedWork  = work::computePerformedWork(userReturnStatus, processedIn, processedOut, kIsSourceBlock);
+        if (performedWork > 0UZ) {
+            progress->incrementAndGet();
+        }
+        return {requestedWork, performedWork, userReturnStatus};
+    }
+
     /**
      * @brief Process as many samples as available and compatible with the internal boundary requirements or limited by 'requested_work`
      *
@@ -2261,84 +2053,12 @@ public:
      * @return { requested_work, performed_work, status}
      */
     template<typename = void>
-    work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept
-    requires(!blockingIO) // regular non-blocking call
-    {
+    work::Result work(std::size_t requestedWork = std::numeric_limits<std::size_t>::max()) noexcept {
         if constexpr (Derived::blockCategory != block::Category::NormalBlock) {
             return {requestedWork, 0UZ, gr::work::Status::OK};
         } else {
             return workInternal(requestedWork);
         }
-    }
-
-    work::Status invokeWork()
-    requires(blockingIO && Derived::blockCategory == block::Category::NormalBlock)
-    {
-        auto [work_requested, work_done, last_status] = workInternal(std::atomic_load_explicit(&ioRequestedWork, std::memory_order_acquire));
-        ioWorkDone.increment(work_requested, work_done);
-        ioLastWorkStatus.exchange(last_status, std::memory_order_relaxed);
-        return last_status;
-    }
-
-    /**
-     * @brief Process as many samples as available and compatible with the internal boundary requirements or limited by 'requested_work`
-     *
-     * @param requested_work: usually the processed number of input samples, but could be any other metric as long as
-     * requested_work limit as an affine relation with the returned performed_work.
-     * @return { requested_work, performed_work, status}
-     */
-    template<typename = void>
-    work::Result work(std::size_t requested_work = std::numeric_limits<std::size_t>::max()) noexcept
-    requires(blockingIO && Derived::blockCategory == block::Category::NormalBlock) // regular blocking call (e.g. wating on HW, timer, blocking for any other reasons) -> this should be an exceptional use
-    {
-        constexpr bool useIoThread = std::disjunction_v<std::is_same<BlockingIO<true>, Arguments>...>;
-        std::atomic_store_explicit(&ioRequestedWork, requested_work, std::memory_order_release);
-
-        bool expectedThreadState = false;
-        if (lifecycle::isActive(this->state()) && this->ioThreadRunning.compare_exchange_strong(expectedThreadState, true, std::memory_order_acq_rel)) {
-            if constexpr (useIoThread) { // use graph-provided ioThreadPool
-                std::shared_ptr<thread_pool::TaskExecutor> executor = gr::thread_pool::Manager::instance().get(compute_domain);
-                if (!executor) {
-                    emitErrorMessage("work(..)", std::format("blockingIO with useIoThread - no ioThreadPool being set or '{}' is unknown", compute_domain));
-                    return {requested_work, 0UZ, work::Status::ERROR};
-                }
-
-                executor->execute([this]() {
-                    assert(lifecycle::isActive(this->state()));
-                    gr::thread_pool::thread::setThreadName(gr::meta::shorten_type_name(this->unique_name));
-
-                    lifecycle::State actualThreadState = this->state();
-                    while (lifecycle::isActive(actualThreadState)) {
-                        // execute ten times before testing actual state -- minimises overhead atomic load to work execution if the latter is a noop or very fast to execute
-                        for (std::size_t testState = 0UZ; testState < 10UZ; ++testState) {
-                            if (invokeWork() == work::Status::DONE) {
-                                actualThreadState = lifecycle::State::REQUESTED_STOP;
-                                emitErrorMessageIfAny("REQUESTED_STOP -> REQUESTED_STOP", this->changeStateTo(lifecycle::State::REQUESTED_STOP));
-                                break;
-                            }
-                        }
-                        actualThreadState = this->state();
-                    }
-                    emitErrorMessageIfAny("-> STOPPED", this->changeStateTo(lifecycle::State::STOPPED));
-                    ioThreadRunning.store(false);
-                });
-            } else { // use user-provided ioThreadPool
-                // let user call 'work' explicitly and set both 'ioWorkDone' and 'ioLastWorkStatus'
-            }
-        }
-        if constexpr (!useIoThread) {
-            const bool blockIsActive = lifecycle::isActive(this->state());
-            if (!blockIsActive) {
-                ioLastWorkStatus.exchange(work::Status::DONE, std::memory_order_relaxed);
-            }
-        }
-
-        const auto& [accumulatedRequestedWork, performedWork] = ioWorkDone.getAndReset();
-        // TODO: this is just "working" solution for deadlock with emscripten, need to be investigated further
-#if defined(__EMSCRIPTEN__)
-        std::this_thread::sleep_for(std::chrono::nanoseconds(1));
-#endif
-        return {accumulatedRequestedWork, performedWork, ioLastWorkStatus.load()};
     }
 
     void processMessages([[maybe_unused]] const MsgPortInBuiltin& port, std::span<const Message> messages) {
@@ -2351,25 +2071,15 @@ public:
                 continue;
             }
 
-            PropertyCallback callback = nullptr;
-            // Attempt to find a matching property callback or use the unmatchedPropertyHandler.
-            if (auto it = propertyCallbacks.find(message.endpoint); it != propertyCallbacks.end()) {
-                callback = it->second;
-            } else {
-                if constexpr (requires(std::string_view sv, Message m) {
-                                  { self().unmatchedPropertyHandler(sv, m) } -> std::same_as<std::optional<Message>>;
-                              }) {
-                    callback = &Derived::unmatchedPropertyHandler;
-                }
-            }
-
-            if (callback == nullptr) {
+            auto it = propertyCallbacks.find(message.endpoint);
+            if (it == propertyCallbacks.end()) {
                 continue; // did not find matching property callback
             }
+            BlockBase::PropertyCallback callback = it->second;
 
             std::optional<Message> retMessage;
             try {
-                retMessage = callback(self(), message.endpoint, message); // N.B. life-time: message is copied
+                retMessage = (this->*callback)(message.endpoint, message); // N.B. life-time: message is copied
             } catch (const gr::exception& e) {
                 retMessage       = Message{message};
                 retMessage->data = std::unexpected(Error(e));
@@ -2387,7 +2097,7 @@ public:
 
             retMessage->cmd             = Final; // N.B. could enable/allow for partial if we return multiple messages (e.g. using coroutines?)
             retMessage->serviceName     = unique_name;
-            WriterSpanLike auto msgSpan = msgOut.streamWriter().tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
+            WriterSpanLike auto msgSpan = msgOut.streamWriter().template tryReserve<SpanReleasePolicy::ProcessAll>(1UZ);
             if (msgSpan.empty()) {
                 throw gr::exception(std::format("{}::processMessages() can not reserve span for message\n", name));
             } else {
@@ -2511,8 +2221,6 @@ std::format(R"(gr::work::Status processBulk({}{}{}) {{
     }
 }
 
-template<typename Derived, typename... Arguments>
-inline std::atomic_size_t Block<Derived, Arguments...>::_uniqueIdCounter{0UZ};
 } // namespace gr
 
 namespace gr {
@@ -2522,21 +2230,20 @@ namespace gr {
  */
 template<BlockLike TBlock>
 [[nodiscard]] /*constexpr*/ std::string blockDescription() noexcept {
-    using DerivedBlock         = typename TBlock::derived_t;
-    using ArgumentList         = typename TBlock::block_template_parameters;
-    using SupportedTypes       = typename ArgumentList::template find_or_default<is_supported_types, DefaultSupportedTypes>;
-    constexpr bool kIsBlocking = ArgumentList::template contains<BlockingIO<true>> || ArgumentList::template contains<BlockingIO<false>>;
+    using DerivedBlock   = typename TBlock::derived_t;
+    using ArgumentList   = typename TBlock::block_template_parameters;
+    using SupportedTypes = typename ArgumentList::template find_or_default<is_supported_types, DefaultSupportedTypes>;
 
-    // re-enable once string and constexpr static is supported by all compilers
-    /*constexpr*/ std::string ret = std::format("# {}\n{}\n{}\n**supported data types:**", //
-        gr::meta::type_name<DerivedBlock>(), TBlock::description, kIsBlocking ? "**BlockingIO**\n_i.e. potentially non-deterministic/non-real-time behaviour_\n" : "");
-    gr::meta::typelist<SupportedTypes>::for_each([&](std::size_t index, auto&& t) {
+    // re-enable once all compilers support string and constexpr static
+    /*constexpr*/ std::string ret = std::format("# {}\n{}\n**supported data types:**", //
+        gr::meta::type_name<DerivedBlock>(), TBlock::description);
+    gr::meta::typelist<SupportedTypes>::for_each([&ret](std::size_t index, auto&& t) {
         std::string type_name = gr::meta::type_name<decltype(t)>();
         ret += std::format("{}:{} ", index, type_name);
     });
     ret += std::format("\n**Parameters:**\n");
     if constexpr (refl::reflectable<DerivedBlock>) {
-        refl::for_each_data_member_index<DerivedBlock>([&](auto kIdx) {
+        refl::for_each_data_member_index<DerivedBlock>([&ret](auto kIdx) {
             using RawType = std::remove_cvref_t<refl::data_member_type<DerivedBlock, kIdx>>;
             using Type    = unwrap_if_wrapped_t<RawType>;
             if constexpr ((std::integral<Type> || std::floating_point<Type> || std::is_same_v<Type, std::string>)) {
@@ -2652,7 +2359,7 @@ int registerBlock(auto& registerInstance) {
  */
 template<template<typename...> typename TBlock, typename... Tuples>
 inline constexpr int registerBlockTT(auto& registerInstance) {
-    meta::outer_product<meta::to_typelist<Tuples>...>::for_each([&]<typename Types>(std::size_t, Types*) { registerBlock<TBlock, typename Types::template apply<BlockParameters>>(registerInstance); });
+    meta::outer_product<meta::to_typelist<Tuples>...>::for_each([&registerInstance]<typename Types>(std::size_t, Types*) { registerBlock<TBlock, typename Types::template apply<BlockParameters>>(registerInstance); });
     return {};
 }
 
@@ -2669,7 +2376,7 @@ inline constexpr int registerBlockTT(auto& registerInstance) {
 // (yet). And in principle, there's always another overload missing.
 template<template<typename, auto> typename TBlock, auto Value0, typename... TBlockParameters, typename TRegisterInstance>
 inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
-    auto addBlockType = [&]<typename Type> {
+    auto addBlockType = [&registerInstance]<typename Type> {
         static_assert(!meta::is_instantiation_of<Type, BlockParameters>);
         using ThisBlock = TBlock<Type, Value0>;
         registerInstance.template addBlockType<ThisBlock>();
@@ -2680,7 +2387,7 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
 
 template<template<typename, typename, auto> typename TBlock, auto Value0, typename... TBlockParameters, typename TRegisterInstance>
 inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
-    auto addBlockType = [&]<typename Type> {
+    auto addBlockType = [&registerInstance]<typename Type> {
         static_assert(meta::is_instantiation_of<Type, BlockParameters>);
         static_assert(Type::size == 2);
         using ThisBlock = TBlock<typename Type::template at<0>, typename Type::template at<1>, Value0>;
@@ -2692,7 +2399,7 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
 
 template<template<typename, auto, auto> typename TBlock, auto Value0, auto Value1, typename... TBlockParameters, typename TRegisterInstance>
 inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
-    auto addBlockType = [&]<typename Type> {
+    auto addBlockType = [&registerInstance]<typename Type> {
         static_assert(!meta::is_instantiation_of<Type, BlockParameters>);
         using ThisBlock = TBlock<Type, Value0, Value1>;
         registerInstance.template addBlockType<ThisBlock>();
@@ -2703,7 +2410,7 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
 
 template<template<typename, typename, auto, auto> typename TBlock, auto Value0, auto Value1, typename... TBlockParameters, typename TRegisterInstance>
 inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
-    auto addBlockType = [&]<typename Type> {
+    auto addBlockType = [&registerInstance]<typename Type> {
         static_assert(meta::is_instantiation_of<Type, BlockParameters>);
         static_assert(Type::size == 2);
         using ThisBlock = TBlock<typename Type::template at<0>, typename Type::template at<1>, Value0, Value1>;
@@ -2713,62 +2420,54 @@ inline constexpr int registerBlock(TRegisterInstance& registerInstance) {
     return {};
 }
 
-template<typename Function, typename Tuple, typename... Tuples>
-inline constexpr auto for_each_port(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
-    return gr::meta::tuple_for_each(
-        [&function](auto&&... args) {
-            (..., ([&function](auto&& arg) {
-                using ArgType = std::decay_t<decltype(arg)>;
-                if constexpr (traits::port::is_port_v<ArgType>) {
-                    function(arg); // arg is a port, apply function directly
-                } else if constexpr (traits::port::is_port_collection_v<ArgType>) {
-                    for (auto& port : arg) { // arg is a collection of ports, apply function to each port
-                        function(port);
-                    }
-                } else {
-                    static_assert(gr::meta::always_false<Tuple>, "not a port or collection of ports");
+template<typename Function, typename Tuple>
+inline constexpr void for_each_port(Function&& function, Tuple&& tuple) {
+    gr::meta::tuple_for_each(
+        [&function](auto&& arg) {
+            using ArgType = std::decay_t<decltype(arg)>;
+            if constexpr (traits::port::is_port_v<ArgType>) {
+                function(arg); // arg is a port, apply function directly
+            } else if constexpr (traits::port::is_port_collection_v<ArgType>) {
+                for (auto& port : arg) { // arg is a collection of ports, apply function to each port
+                    function(port);
                 }
-            }(args)));
+            } else {
+                static_assert(gr::meta::always_false<ArgType>, "not a port or collection of ports");
+            }
         },
-        std::forward<Tuple>(tuple), std::forward<Tuples>(tuples)...);
+        std::forward<Tuple>(tuple));
 }
 
-template<typename Function, typename Tuple, typename... Tuples>
-inline constexpr auto for_each_reader_span(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
-    return gr::meta::tuple_for_each(
-        [&function](auto&&... args) {
-            (..., ([&function](auto&& arg) {
-                using ArgType = std::decay_t<decltype(arg)>;
-
-                if constexpr (ReaderSpanLike<typename ArgType::value_type>) {
-                    for (auto& param : arg) {
-                        function(param);
-                    }
-                } else if (ReaderSpanLike<ArgType>) {
-                    function(arg);
+template<typename Function, typename Tuple>
+inline constexpr void for_each_reader_span(Function&& function, Tuple&& tuple) {
+    gr::meta::tuple_for_each(
+        [&function](auto&& arg) {
+            using ArgType = std::decay_t<decltype(arg)>;
+            if constexpr (ReaderSpanLike<typename ArgType::value_type>) {
+                for (auto& param : arg) {
+                    function(param);
                 }
-            }(args)));
+            } else if constexpr (ReaderSpanLike<ArgType>) {
+                function(arg);
+            }
         },
-        std::forward<Tuple>(tuple), std::forward<Tuples>(tuples)...);
+        std::forward<Tuple>(tuple));
 }
 
-template<typename Function, typename Tuple, typename... Tuples>
-inline constexpr auto for_each_writer_span(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
-    return gr::meta::tuple_for_each(
-        [&function](auto&&... args) {
-            (..., ([&function](auto&& arg) {
-                using ArgType = std::decay_t<decltype(arg)>;
-
-                if constexpr (WriterSpanLike<typename ArgType::value_type>) {
-                    for (auto& param : arg) {
-                        function(param);
-                    }
-                } else if (WriterSpanLike<ArgType>) {
-                    function(arg);
+template<typename Function, typename Tuple>
+inline constexpr void for_each_writer_span(Function&& function, Tuple&& tuple) {
+    gr::meta::tuple_for_each(
+        [&function](auto&& arg) {
+            using ArgType = std::decay_t<decltype(arg)>;
+            if constexpr (WriterSpanLike<typename ArgType::value_type>) {
+                for (auto& param : arg) {
+                    function(param);
                 }
-            }(args)));
+            } else if constexpr (WriterSpanLike<ArgType>) {
+                function(arg);
+            }
         },
-        std::forward<Tuple>(tuple), std::forward<Tuples>(tuples)...);
+        std::forward<Tuple>(tuple));
 }
 
 template<typename TFunction, typename TPortsTuple, typename TSpansTuple>
@@ -2814,7 +2513,7 @@ struct std::formatter<gr::work::Result, char> {
 
     template<typename FormatContext>
     auto format(const gr::work::Result& result, FormatContext& ctx) const {
-        return std::format_to(ctx.out(), "requested_work: {}, performed_work: {}, status: {}", result.requested_work, result.performed_work, magic_enum::enum_name(result.status));
+        return std::format_to(ctx.out(), "requested_work: {}, performed_work: {}, status: {}", result.requested_work, result.performed_work, gr::meta::enumName(result.status).value_or(""));
     }
 };
 

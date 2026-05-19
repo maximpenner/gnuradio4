@@ -40,7 +40,7 @@ Terminates when n_samples_max is reached (0 = unlimited).)"">;
     A<float, "sample_rate", Visible, Doc<"average sample rate in Hz">>                                           sample_rate   = 1000.f;
     A<gr::Size_t, "chunk_size", Visible, Doc<"number of samples per update">>                                    chunk_size    = 100;
     A<Tensor<std::uint64_t>, "tag_times", Doc<"times when tags should be emitted [ns]">>                         tag_times;
-    A<Tensor<pmt::Value>, "tag_values", Doc<"list of '<trigger name>/<ctx>' formatted tags">>                    tag_values;
+    A<std::vector<std::string>, "tag_values", Doc<"list of '<trigger name>/<ctx>' formatted tags">>              tag_values;
     A<std::uint64_t, "repeat_period", Visible, Doc<"if repeat_period > last tag_time -> restart tags, in [ns]">> repeat_period{0U};
     A<bool, "do_zero_order_hold", Doc<"if tag_times>tag_values: true=publish last tag, false=publish empty">>    do_zero_order_hold  = false;
     A<bool, "use_internal_thread", Doc<"true: GR4 timer thread; false: on-demand/external timing">>              use_internal_thread = true;
@@ -105,8 +105,7 @@ Terminates when n_samples_max is reached (0 = unlimited).)"">;
             return work::Status::INSUFFICIENT_INPUT_ITEMS;
         }
 
-        const auto now              = ClockSourceType::now();
-        const auto currentTimePoint = this->blockingSyncLastUpdateTime();
+        const auto now = ClockSourceType::now();
 
         gr::Size_t samplesToNextTimeTag = std::numeric_limits<gr::Size_t>::max();
         if (!tag_times.value.empty()) {
@@ -120,9 +119,9 @@ Terminates when n_samples_max is reached (0 = unlimited).)"">;
                 _nextTimeTag                       = 0;
             }
             if (_nextTimeTag < tag_times.value.size()) {
-                const auto currentTagTime = std::chrono::microseconds(tag_times.value[_nextTimeTag] / 1000);
-                const auto timeToNextTag  = std::chrono::duration_cast<std::chrono::microseconds>((_beginSequenceTimePoint + currentTagTime - currentTimePoint));
-                samplesToNextTimeTag      = static_cast<gr::Size_t>(std::max(0.0, (static_cast<double>(timeToNextTag.count()) / 1.e6) * static_cast<double>(sample_rate)));
+                const auto tagOffsetNs       = std::chrono::duration_cast<std::chrono::nanoseconds>(_beginSequenceTimePoint - this->blockingSyncStartTime()).count() + static_cast<std::int64_t>(tag_times.value[_nextTimeTag]);
+                const auto absoluteTagSample = static_cast<gr::Size_t>(std::max(0L, std::lround(static_cast<double>(tagOffsetNs) / 1.e9 * static_cast<double>(sample_rate))));
+                samplesToNextTimeTag         = (absoluteTagSample >= n_samples_produced) ? (absoluteTagSample - n_samples_produced) : 0U;
             }
         }
 
@@ -140,7 +139,7 @@ Terminates when n_samples_max is reached (0 = unlimited).)"">;
             }
         } else {
             if (!tag_times.value.empty() && _nextTimeTag < tag_times.value.size() && samplesToNextTimeTag <= samplesToProduce) {
-                const std::string value = _nextTimeTag < tag_values.value.size() ? tag_values.value[_nextTimeTag].value_or(std::string()) : (do_zero_order_hold ? tag_values.value.back().value_or(std::string()) : "");
+                const std::string value = _nextTimeTag < tag_values.value.size() ? tag_values.value[_nextTimeTag] : (do_zero_order_hold ? tag_values.value.back() : "");
 
                 std::string           triggerName;
                 [[maybe_unused]] bool triggerNameNegated;

@@ -3,8 +3,8 @@
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/testing/NullSources.hpp>
 
-#include <GrBasicBlocks.hpp>
-#include <GrTestingBlocks.hpp>
+#include <gnuradio-4.0/GrBasicBlocks.hpp>
+#include <gnuradio-4.0/GrTestingBlocks.hpp>
 
 #include "TestBlockRegistryContext.hpp"
 
@@ -81,8 +81,8 @@ const boost::ut::suite GraphMessageTests = [] {
         gr::Graph      testGraph(context->loader);
         gr::MsgPortIn  fromGraph;
 
-        expect(eq(ConnectionResult::SUCCESS, toGraph.connect(testGraph.msgIn)));
-        expect(eq(ConnectionResult::SUCCESS, testGraph.msgOut.connect(fromGraph)));
+        expect(toGraph.connect(testGraph.msgIn).has_value());
+        expect(testGraph.msgOut.connect(fromGraph).has_value());
 
         "Get available block types"_test = [&] {
             sendMessage<Get>(toGraph, testGraph.unique_name, graph::property::kRegistryBlockTypes /* endpoint */, {} /* data */);

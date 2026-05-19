@@ -40,6 +40,24 @@ struct MultiPortTestSource : public gr::Block<MultiPortTestSource<T, nPorts>> {
     }
 };
 
+const boost::ut::suite<"New connection API tests"> connection_api_tests = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+
+    "Graph connection buffer size test - default"_test = [] {
+        Graph graph;
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        auto& sink = graph.emplaceBlock<NullSink<float>>();
+
+        expect(graph.connect<"out", "in">(src, sink).has_value());
+        graph.connectPendingEdges();
+
+        expect(eq(src.out.bufferSize(), graph::defaultMinBufferSize(true)));
+        expect(eq(sink.in.bufferSize(), graph::defaultMinBufferSize(true)));
+    };
+};
+
 const boost::ut::suite<"GraphTests"> _1 = [] {
     using namespace boost::ut;
     using namespace gr;
@@ -50,7 +68,7 @@ const boost::ut::suite<"GraphTests"> _1 = [] {
         auto& src  = graph.emplaceBlock<NullSource<float>>();
         auto& sink = graph.emplaceBlock<NullSink<float>>();
 
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src).to<"in">(sink)));
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = undefined_size}).has_value());
         graph.connectPendingEdges();
 
         expect(eq(src.out.bufferSize(), graph::defaultMinBufferSize(true)));
@@ -62,10 +80,9 @@ const boost::ut::suite<"GraphTests"> _1 = [] {
         auto& src  = graph.emplaceBlock<NullSource<float>>();
         auto& sink = graph.emplaceBlock<NullSink<float>>();
 
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src, 8000UZ).to<"in">(sink)));
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = 8000UZ}).has_value());
         graph.connectPendingEdges();
 
-        // Note: the actual size is always power of 2 and aligned with page size, see std::bit_ceil
         expect(ge(src.out.bufferSize(), 8000UZ));
         expect(ge(sink.in.bufferSize(), 8000UZ));
     };
@@ -77,9 +94,9 @@ const boost::ut::suite<"GraphTests"> _1 = [] {
         auto& sink2 = graph.emplaceBlock<NullSink<float>>();
         auto& sink3 = graph.emplaceBlock<NullSink<float>>();
 
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src, 2000UZ).to<"in">(sink1)));
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src, 10000UZ).to<"in">(sink2)));
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src, 8000UZ).to<"in">(sink3)));
+        expect(graph.connect<"out", "in">(src, sink1, {.minBufferSize = 2000UZ}).has_value());
+        expect(graph.connect<"out", "in">(src, sink2, {.minBufferSize = 10000UZ}).has_value());
+        expect(graph.connect<"out", "in">(src, sink3, {.minBufferSize = 8000UZ}).has_value());
 
         graph.connectPendingEdges();
 
@@ -102,7 +119,7 @@ const boost::ut::suite<"GraphTests"> _1 = [] {
         auto&              sink1            = graph.emplaceBlock<NullSink<float>>();
 
         // only the first port is connected
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out", 0>(src, customBufferSize).to<"in">(sink1)));
+        expect(graph.connect(src, "out#0", sink1, "in", {.minBufferSize = customBufferSize}).has_value());
 
         scheduler::Simple<scheduler::ExecutionPolicy::multiThreaded> sched;
         if (auto ret = sched.exchange(std::move(graph)); !ret) {
@@ -117,6 +134,77 @@ const boost::ut::suite<"GraphTests"> _1 = [] {
 
         expect(eq(src.out[1].bufferSize(), 4096UZ)); // port default buffer size
         expect(eq(src.out[2].bufferSize(), 4096UZ)); // port default buffer size
+    };
+};
+
+struct TrackingResource : std::pmr::memory_resource {
+    std::pmr::memory_resource* _upstream;
+    std::atomic<std::size_t>   _allocCount{0};
+
+    explicit TrackingResource(std::pmr::memory_resource* upstream = std::pmr::get_default_resource()) : _upstream(upstream) {}
+
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        ++_allocCount;
+        return _upstream->allocate(bytes, alignment);
+    }
+
+    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override { _upstream->deallocate(p, bytes, alignment); }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+const boost::ut::suite<"EdgeParameters PMR forwarding"> _pmr = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+
+    "Graph connection forwards data PMR resource"_test = [] {
+        TrackingResource dataTracker;
+        Graph            graph;
+        auto&            src  = graph.emplaceBlock<NullSource<float>>();
+        auto&            sink = graph.emplaceBlock<NullSink<float>>();
+
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = 4096UZ, .dataResource = &dataTracker}).has_value());
+        graph.connectPendingEdges();
+
+        expect(gt(dataTracker._allocCount.load(), 0UZ)) << "data PMR resource should have been used for stream buffer";
+    };
+
+    "Graph connection forwards tag PMR resource"_test = [] {
+        TrackingResource tagTracker;
+        Graph            graph;
+        auto&            src  = graph.emplaceBlock<NullSource<float>>();
+        auto&            sink = graph.emplaceBlock<NullSink<float>>();
+
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = 4096UZ, .tagResource = &tagTracker}).has_value());
+        graph.connectPendingEdges();
+
+        expect(gt(tagTracker._allocCount.load(), 0UZ)) << "tag PMR resource should have been used for tag buffer";
+    };
+
+    "Graph connection forwards both PMR resources"_test = [] {
+        TrackingResource dataTracker;
+        TrackingResource tagTracker;
+        Graph            graph;
+        auto&            src  = graph.emplaceBlock<NullSource<float>>();
+        auto&            sink = graph.emplaceBlock<NullSink<float>>();
+
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = 4096UZ, .dataResource = &dataTracker, .tagResource = &tagTracker}).has_value());
+        graph.connectPendingEdges();
+
+        expect(gt(dataTracker._allocCount.load(), 0UZ)) << "data PMR resource should have been used";
+        expect(gt(tagTracker._allocCount.load(), 0UZ)) << "tag PMR resource should have been used";
+    };
+
+    "Graph connection with default PMR resources still works"_test = [] {
+        Graph graph;
+        auto& src  = graph.emplaceBlock<NullSource<float>>();
+        auto& sink = graph.emplaceBlock<NullSink<float>>();
+
+        expect(graph.connect<"out", "in">(src, sink, {.minBufferSize = 4096UZ}).has_value());
+        graph.connectPendingEdges();
+
+        expect(ge(src.out.bufferSize(), 4096UZ));
     };
 };
 
@@ -186,7 +274,7 @@ const boost::ut::suite<"GraphExtensionsTests"> _2 = [] {
         Graph              graph;
         NullSource<float>& src = graph.emplaceBlock<NullSource<float>>();
         NullSink<float>&   snk = graph.emplaceBlock<NullSink<float>>();
-        expect(eq(graph.connect<"out">(src).to<"in">(snk), ConnectionResult::SUCCESS));
+        expect(graph.connect<"out", "in">(src, snk).has_value());
 
         expect(graph.containsEdge(graph.edges().front()));
         graph.connectPendingEdges();
@@ -197,7 +285,7 @@ const boost::ut::suite<"GraphExtensionsTests"> _2 = [] {
         Graph              graph;
         NullSource<float>& src = graph.emplaceBlock<NullSource<float>>();
         NullSink<float>&   snk = graph.emplaceBlock<NullSink<float>>();
-        expect(eq(graph.connect<"out">(src).to<"in">(snk), ConnectionResult::SUCCESS));
+        expect(graph.connect<"out", "in">(src, snk).has_value());
         graph.connectPendingEdges();
 
         const auto edge = graph.edges().front();
@@ -227,7 +315,7 @@ const boost::ut::suite<"GraphExtensionsTests"> _2 = [] {
         NullSource<float>& src = graph.emplaceBlock<NullSource<float>>();
         NullSink<float>&   snk = graph.emplaceBlock<NullSink<float>>();
 
-        expect(eq(ConnectionResult::SUCCESS, graph.connect<"out">(src).to<"in">(snk)));
+        expect(graph.connect<"out", "in">(src, snk, {.minBufferSize = undefined_size}).has_value());
         graph.connectPendingEdges();
 
         int count = 0;
@@ -404,6 +492,149 @@ const boost::ut::suite<"forEachBlock"> _3 = [] {
         visitBlocks<gr::block::Category::TransparentBlockGroup>(root, 1UZ, {std::string(nestedScheduler->uniqueName())}, //
             gr::block::Category::ScheduledBlockGroup);
         visitBlocks<gr::block::Category::TransparentBlockGroup>(root, 0UZ, {}, gr::block::Category::TransparentBlockGroup);
+    };
+};
+
+namespace {
+struct TestMR : std::pmr::memory_resource {
+    std::size_t allocCount = 0;
+    void*       do_allocate(std::size_t n, std::size_t) override {
+        ++allocCount;
+        return ::operator new(n == 0 ? 1 : n);
+    }
+    void do_deallocate(void* p, std::size_t, std::size_t) override { ::operator delete(p); }
+    bool do_is_equal(const std::pmr::memory_resource& o) const noexcept override { return this == &o; }
+};
+
+std::pmr::memory_resource* testProvider(const gr::ComputeDomain&, void* ctx) { return static_cast<std::pmr::memory_resource*>(ctx); }
+} // namespace
+
+const boost::ut::suite<"Edge domain resolution"> _edgeDomainResolution = [] {
+    using namespace boost::ut;
+    using namespace gr;
+    using namespace gr::testing;
+
+    "edge with explicit domain resolves resource"_test = [] {
+        TestMR mr;
+        ComputeRegistry::instance().register_provider("test-edge", &testProvider);
+
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        EdgeParameters params;
+        params.domain      = ComputeDomain::gpu_shared("test-edge");
+        params.domain.user = &mr;
+        expect(testGraph.connect<"out", "in">(src, sink, params).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(edges[0]._dataResource == &mr) << "edge buffer must use resolved resource";
+        expect(edges[0]._tagResource == &mr) << "tag buffer must use resolved resource";
+    };
+
+    "edge with host domain uses default resource"_test = [] {
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        expect(testGraph.connect<"out", "in">(src, sink).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(edges[0]._dataResource == std::pmr::get_default_resource()) << "host domain must use default resource";
+    };
+
+    "explicit dataResource overrides domain resolution"_test = [] {
+        TestMR explicitMr;
+        ComputeRegistry::instance().register_provider("test-override", &testProvider);
+
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        EdgeParameters params;
+        params.domain       = ComputeDomain::gpu_shared("test-override");
+        params.dataResource = &explicitMr;
+        params.tagResource  = &explicitMr;
+        expect(testGraph.connect<"out", "in">(src, sink, params).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(edges[0]._dataResource == &explicitMr) << "explicit resource must override domain resolution";
+    };
+
+    "block compute_domain auto-resolves edge resource"_test = [] {
+        TestMR mr;
+        ComputeRegistry::instance().register_provider("test-auto", &testProvider);
+
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}, {"compute_domain", "gpu:test-auto"}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        // connect without explicit EdgeParameters — domain should auto-resolve from block compute_domain
+        expect(testGraph.connect<"out", "in">(src, sink).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(eq(edges[0]._domain.kind, "gpu"sv)) << "domain kind auto-resolved from block compute_domain";
+        expect(eq(edges[0]._domain.backend, "test-auto"sv)) << "domain backend auto-resolved";
+    };
+
+    "explicit EdgeParameters.domain overrides block compute_domain"_test = [] {
+        TestMR mr;
+        ComputeRegistry::instance().register_provider("test-explicit-dom", &testProvider);
+
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}, {"compute_domain", "gpu:test-auto"}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        EdgeParameters params;
+        params.domain      = ComputeDomain::gpu_shared("test-explicit-dom");
+        params.domain.user = &mr;
+        expect(testGraph.connect<"out", "in">(src, sink, params).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(edges[0]._dataResource == &mr) << "explicit EdgeParameters.domain must override block compute_domain";
+        expect(eq(edges[0]._domain.backend, "test-explicit-dom"sv)) << "explicit domain backend preserved";
+    };
+
+    "two CPU blocks produce default edge"_test = [] {
+        Graph testGraph;
+        auto& src  = testGraph.emplaceBlock<TagSource<float, ProcessFunction::USE_PROCESS_BULK>>({{"n_samples_max", gr::Size_t(10)}, {"verbose_console", false}});
+        auto& sink = testGraph.emplaceBlock<TagSink<float, ProcessFunction::USE_PROCESS_BULK>>({{"verbose_console", false}});
+
+        expect(testGraph.connect<"out", "in">(src, sink).has_value());
+
+        scheduler::Simple<> sched;
+        expect(sched.exchange(std::move(testGraph)).has_value());
+        expect(sched.runAndWait().has_value());
+
+        auto edges = sched.graph().edges();
+        expect(eq(edges.size(), 1UZ));
+        expect(eq(edges[0]._domain.kind, "host"sv)) << "default CPU blocks must produce host domain edge";
+        expect(edges[0]._dataResource == std::pmr::get_default_resource()) << "default resource";
     };
 };
 

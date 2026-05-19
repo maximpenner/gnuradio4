@@ -2,12 +2,15 @@
 #define GNURADIO_BLOCK_MODEL_HPP
 
 #include <gnuradio-4.0/Block.hpp>
+#include <gnuradio-4.0/ComputeDomain.hpp>
 #include <gnuradio-4.0/LifeCycle.hpp>
 #include <gnuradio-4.0/Port.hpp>
 #include <gnuradio-4.0/Settings.hpp>
 #include <gnuradio-4.0/thread/thread_pool.hpp>
 
 #include <charconv>
+#include <memory_resource>
+#include <mutex>
 
 namespace gr {
 class BlockModel;
@@ -30,7 +33,12 @@ struct PortDefinition {
     std::variant<IndexBased, StringBased> definition;
 
     constexpr PortDefinition(std::size_t _topLevel, std::size_t _subIndex = meta::invalid_index) : definition(IndexBased{_topLevel, _subIndex}) {}
+
     constexpr PortDefinition(std::string name) : definition(StringBased(std::move(name))) {}
+
+    template<std::convertible_to<std::string_view> StringLike>
+    constexpr PortDefinition(const StringLike& name) : definition(StringBased(std::string(name))) {}
+
     bool operator==(const PortDefinition& other) const { return (definition == other.definition); }
 };
 } // namespace gr
@@ -39,20 +47,28 @@ namespace std { // needs to be defined in std namespace to be used e.g. in std::
 template<>
 struct hash<gr::PortDefinition> {
     std::size_t operator()(const gr::PortDefinition& p) const noexcept {
-        if (std::holds_alternative<gr::PortDefinition::IndexBased>(p.definition)) {
-            const auto& def = std::get<gr::PortDefinition::IndexBased>(p.definition);
-            std::size_t h1  = std::hash<std::size_t>{}(def.topLevel);
-            std::size_t h2  = std::hash<std::size_t>{}(def.subIndex);
+        if (auto* idx = std::get_if<gr::PortDefinition::IndexBased>(&p.definition)) {
+            std::size_t h1 = std::hash<std::size_t>{}(idx->topLevel);
+            std::size_t h2 = std::hash<std::size_t>{}(idx->subIndex);
             return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2)); // hash_combine
-        } else {                                                   // string-based
-            const auto& def = std::get<gr::PortDefinition::StringBased>(p.definition);
-            return std::hash<std::string>{}(def.name);
+        } else {
+            return std::hash<std::string>{}(std::get<gr::PortDefinition::StringBased>(p.definition).name);
         }
     }
 };
 } // namespace std
 
 namespace gr {
+
+struct EdgeParameters {
+    std::size_t                minBufferSize = undefined_size;
+    std::int32_t               weight        = 0;
+    std::string                name          = "unnamed edge";
+    std::pmr::memory_resource* dataResource  = std::pmr::get_default_resource();
+    std::pmr::memory_resource* tagResource   = std::pmr::get_default_resource();
+
+    ComputeDomain domain = ComputeDomain::host(); // resolution: explicit domain > block compute_domain > host; resolved in applyEdgeConnection()
+};
 
 struct Edge {
     enum class EdgeState { WaitingToBeConnected, Connected, Overridden, ErrorConnecting, PortNotFound, IncompatiblePorts, Unknown };
@@ -69,13 +85,33 @@ struct Edge {
     DynamicPort*                _destinationPort  = nullptr; /// non-owning reference
 
     // User-controlled member variables
-    std::size_t  _minBufferSize;
-    std::int32_t _weight = 0;
-    std::string  _name   = "unnamed edge"; // custom edge name
+    std::size_t                _minBufferSize;
+    std::int32_t               _weight       = 0;
+    std::string                _name         = "unnamed edge"; // custom edge name
+    std::pmr::memory_resource* _dataResource = std::pmr::get_default_resource();
+    std::pmr::memory_resource* _tagResource  = std::pmr::get_default_resource();
+    ComputeDomain              _domain       = ComputeDomain::host();
+    std::string                _domainStr; // owns the string that _domain.backend may point into
 
     std::shared_ptr<property_map> _uiConstraints{std::make_shared<property_map>()}; // used to store UI and other non-dsp related meta-information
 
     Edge() = delete;
+
+    Edge(const Edge& other) : _sourceBlock(other._sourceBlock), _destinationBlock(other._destinationBlock), _sourcePortDefinition(other._sourcePortDefinition), _destinationPortDefinition(other._destinationPortDefinition), _state(other._state), _actualBufferSize(other._actualBufferSize), _edgeType(other._edgeType), _sourcePort(other._sourcePort), _destinationPort(other._destinationPort), _minBufferSize(other._minBufferSize), _weight(other._weight), _name(other._name), _dataResource(other._dataResource), _tagResource(other._tagResource), _domain(other._domain), _domainStr(other._domainStr), _uiConstraints(other._uiConstraints) {
+        if (!_domainStr.empty()) {
+            _domain = ComputeDomain::parse(_domainStr); // re-parse so string_views point into our _domainStr
+        }
+    }
+    Edge& operator=(const Edge& other) {
+        if (this != &other) {
+            Edge tmp(other);
+            *this = std::move(tmp);
+        }
+        return *this;
+    }
+    Edge(Edge&&) noexcept            = default;
+    Edge& operator=(Edge&&) noexcept = default;
+    ~Edge()                          = default;
 
     explicit Edge(std::shared_ptr<BlockModel> sourceBlock, PortDefinition sourcePortDefinition,               //
         std::shared_ptr<BlockModel> destinationBlock, PortDefinition destinationPortDefinition,               //
@@ -83,6 +119,13 @@ struct Edge {
         : _sourceBlock(sourceBlock), _destinationBlock(destinationBlock),                                     //
           _sourcePortDefinition(sourcePortDefinition), _destinationPortDefinition(destinationPortDefinition), //
           _minBufferSize(minBufferSize), _weight(weight), _name(std::move(name)) {}
+
+    explicit Edge(std::shared_ptr<BlockModel> sourceBlock, PortDefinition sourcePortDefinition,               //
+        std::shared_ptr<BlockModel> destinationBlock, PortDefinition destinationPortDefinition,               //
+        EdgeParameters parameters) noexcept                                                                   //
+        : _sourceBlock(sourceBlock), _destinationBlock(destinationBlock),                                     //
+          _sourcePortDefinition(sourcePortDefinition), _destinationPortDefinition(destinationPortDefinition), //
+          _minBufferSize(parameters.minBufferSize), _weight(parameters.weight), _name(std::move(parameters.name)), _dataResource(parameters.dataResource), _tagResource(parameters.tagResource), _domain(parameters.domain) {}
 
     [[nodiscard]] constexpr const std::shared_ptr<BlockModel>& sourceBlock() const noexcept { return _sourceBlock; }
     [[nodiscard]] constexpr const std::shared_ptr<BlockModel>& destinationBlock() const noexcept { return _destinationBlock; }
@@ -152,14 +195,21 @@ struct hash<gr::Edge> {
 } // namespace std
 
 namespace gr {
+
 class BlockModel {
 public:
     struct NamedPortCollection {
         std::string_view             name;
         std::vector<gr::DynamicPort> ports;
 
-        [[nodiscard]] auto disconnect() {
-            return std::ranges::count_if(ports, [](auto& port) { return port.disconnect() == ConnectionResult::FAILED; }) == 0 ? ConnectionResult::SUCCESS : ConnectionResult::FAILED;
+        [[nodiscard]] std::expected<void, Error> disconnect() {
+            for (auto& port : ports) {
+                auto result = port.disconnect();
+                if (!result) {
+                    return result;
+                }
+            }
+            return {};
         }
     };
 
@@ -180,34 +230,34 @@ protected:
         }
     };
 
-    bool               _dynamicPortsLoaded = false;
-    DynamicPortsLoader _dynamicPortsLoader;
-    DynamicPorts       _dynamicInputPorts;
-    DynamicPorts       _dynamicOutputPorts;
+    mutable std::once_flag _dynamicPortsInitFlag;
+    DynamicPortsLoader     _dynamicPortsLoader;
+    DynamicPorts           _dynamicInputPorts;
+    DynamicPorts           _dynamicOutputPorts;
 
     BlockModel() = default;
 
-    [[nodiscard]] gr::DynamicPort& dynamicPortFromName(DynamicPorts& what, std::string_view name, std::source_location location = std::source_location::current()) {
+    [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicPortFromName(DynamicPorts& what, std::string_view name, std::source_location location = std::source_location::current()) {
         initDynamicPorts();
 
         if (auto separatorIt = std::ranges::find(name, '#'); separatorIt == name.end()) {
             auto it = std::ranges::find_if(what, [name](const DynamicPortOrCollection& portOrCollection) {
                 const auto* port = std::get_if<gr::DynamicPort>(&portOrCollection);
-                return port && port->name == name;
+                return port && port->metaInfo.name == name;
             });
 
             if (it == what.end()) {
-                throw gr::exception(std::format("dynamicPortFromName([{}]) - Port {} not found in {}\n", what.size(), name, uniqueName()), location);
+                return std::unexpected(Error(std::format("dynamicPortFromName([{}]) - Port {} not found in {}", what.size(), name, uniqueName()), location));
             }
 
-            return std::get<gr::DynamicPort>(*it);
+            return &std::get<gr::DynamicPort>(*it);
         } else {
             const std::string_view base(name.begin(), separatorIt);
             const std::string_view indexString(separatorIt + 1, name.end());
             std::size_t            index = -1UZ;
             auto [_, ec]                 = std::from_chars(indexString.data(), indexString.data() + indexString.size(), index);
             if (ec != std::errc()) {
-                throw gr::exception(std::format("dynamicPortFromName([{}]) - Invalid index {} specified, needs to be an integer", what.size(), indexString), location);
+                return std::unexpected(Error(std::format("dynamicPortFromName([{}]) - Invalid index {} specified, needs to be an integer", what.size(), indexString), location));
             }
 
             auto collectionIt = std::ranges::find_if(what, [&base](const DynamicPortOrCollection& portOrCollection) {
@@ -216,49 +266,49 @@ protected:
             });
 
             if (collectionIt == what.cend()) {
-                throw gr::exception(std::format("dynamicPortFromName([{}]) - Invalid name specified name={}, base={}\n", what.size(), name, base), location);
+                return std::unexpected(Error(std::format("dynamicPortFromName([{}]) - Invalid name specified name={}, base={}", what.size(), name, base), location));
             }
 
             auto& collection = std::get<NamedPortCollection>(*collectionIt);
 
             if (index >= collection.ports.size()) {
-                throw gr::exception(std::format("dynamicPortFromName([{}]) - Invalid index {} specified, out of range. Number of ports is {}", what.size(), index, collection.ports.size()), location);
+                return std::unexpected(Error(std::format("dynamicPortFromName([{}]) - Invalid index {} specified, out of range. Number of ports is {}", what.size(), index, collection.ports.size()), location));
             }
 
-            return collection.ports[index];
+            return &collection.ports[index];
         }
     }
 
     template<PortDirection direction, typename PortsVec>
-    DynamicPort& dynamicPortByIndexImpl(PortsVec& portsVec, std::size_t topIndex, std::size_t subIndex, std::source_location loc) {
+    std::expected<DynamicPort*, Error> dynamicPortByIndexImpl(PortsVec& portsVec, std::size_t topIndex, std::size_t subIndex, std::source_location loc) {
         using namespace std::string_view_literals;
         constexpr std::string_view which = (direction == PortDirection::INPUT ? "Input"sv : "Output"sv);
         initDynamicPorts();
 
         if (topIndex >= portsVec.size()) {
-            throw gr::exception(std::format("dynamic{}Port(index: {}, subIndex: {}) - specified topIndex {} is out of range [0, {}]", which, topIndex, subIndex, topIndex, portsVec.size()), loc);
+            return std::unexpected(Error(std::format("dynamic{}Port(index: {}, subIndex: {}) - specified topIndex {} is out of range [0, {}]", which, topIndex, subIndex, topIndex, portsVec.size()), loc));
         }
         auto& entry = portsVec.at(topIndex);
 
         if (auto* collection = std::get_if<NamedPortCollection>(&entry)) {
             if (subIndex == meta::invalid_index) {
-                throw gr::exception(std::format("invalid_argument: dynamic{}Port(index: {}, subIndex: {}) - Need to specify the index in the port collection for {}", which, topIndex, subIndex, collection->name), loc);
+                return std::unexpected(Error(std::format("invalid_argument: dynamic{}Port(index: {}, subIndex: {}) - Need to specify the index in the port collection for {} in {}", which, topIndex, subIndex, collection->name, uniqueName()), loc));
             }
             if (subIndex >= collection->ports.size()) {
-                throw gr::exception(std::format("out_of_range: dynamic{}Port(index: {}, subIndex: {}) - sub-index out of range for {} (size={})", which, topIndex, subIndex, collection->name, collection->ports.size()), loc);
+                return std::unexpected(Error(std::format("out_of_range: dynamic{}Port(index: {}, subIndex: {}) - sub-index out of range for {} (size={})", which, topIndex, subIndex, collection->name, collection->ports.size()), loc));
             }
-            return collection->ports[subIndex];
+            return &collection->ports[subIndex];
         }
 
         auto* single = std::get_if<gr::DynamicPort>(&entry);
         if (!single) {
-            throw gr::exception("variant construction failed", loc);
+            return std::unexpected(Error("variant construction failed", loc));
         }
 
         if (subIndex != meta::invalid_index) {
-            throw gr::exception(std::format("invalid_argument: dynamic{}Port(index: {}, subIndex: {}) - specified sub-index for a normal port {}", which, topIndex, subIndex, single->name), loc);
+            return std::unexpected(Error(std::format("invalid_argument: dynamic{}Port(index: {}, subIndex: {}) - specified sub-index for a normal port {}", which, topIndex, subIndex, single->metaInfo.name), loc));
         }
-        return *single;
+        return single;
     }
 
 public:
@@ -267,20 +317,17 @@ public:
     BlockModel(BlockModel&& other)            = delete;
     BlockModel& operator=(BlockModel&& other) = delete;
 
-    void initDynamicPorts() const {
-        if (!_dynamicPortsLoaded) {
-            _dynamicPortsLoader();
-        }
-    }
+    void initDynamicPorts() const { std::call_once(_dynamicPortsInitFlag, _dynamicPortsLoader); }
 
     MsgPortInBuiltin*  msgIn;
     MsgPortOutBuiltin* msgOut;
 
     static std::string portName(const DynamicPortOrCollection& portOrCollection) {
-        return std::visit(meta::overloaded{                                          //
-                              [](const gr::DynamicPort& port) { return port.name; }, //
-                              [](const NamedPortCollection& namedCollection) { return std::string(namedCollection.name); }},
-            portOrCollection);
+        if (auto* port = std::get_if<gr::DynamicPort>(&portOrCollection)) {
+            return std::string(port->metaInfo.name);
+        } else {
+            return std::string(std::get<NamedPortCollection>(portOrCollection).name);
+        }
     }
 
     [[nodiscard]] virtual std::span<std::shared_ptr<BlockModel>>       blocks() noexcept       = 0;
@@ -297,23 +344,25 @@ public:
         return _dynamicOutputPorts;
     }
 
-    [[nodiscard]] gr::DynamicPort& dynamicInputPort(std::string_view name, std::source_location location = std::source_location::current()) { return dynamicPortFromName(_dynamicInputPorts, name, location); }
-    [[nodiscard]] gr::DynamicPort& dynamicOutputPort(std::string_view name, std::source_location location = std::source_location::current()) { return dynamicPortFromName(_dynamicOutputPorts, name, location); }
-    [[nodiscard]] gr::DynamicPort& dynamicInputPort(std::size_t index, std::size_t subIndex = meta::invalid_index, std::source_location loc = std::source_location::current()) { return dynamicPortByIndexImpl<PortDirection::INPUT>(_dynamicInputPorts, index, subIndex, std::move(loc)); }
-    [[nodiscard]] gr::DynamicPort& dynamicOutputPort(std::size_t index, std::size_t subIndex = meta::invalid_index, std::source_location loc = std::source_location::current()) { return dynamicPortByIndexImpl<PortDirection::OUTPUT>(_dynamicOutputPorts, index, subIndex, std::move(loc)); }
+    [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicInputPort(std::size_t index, std::size_t subIndex = meta::invalid_index, std::source_location loc = std::source_location::current()) { return dynamicPortByIndexImpl<PortDirection::INPUT>(_dynamicInputPorts, index, subIndex, std::move(loc)); }
+    [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicOutputPort(std::size_t index, std::size_t subIndex = meta::invalid_index, std::source_location loc = std::source_location::current()) { return dynamicPortByIndexImpl<PortDirection::OUTPUT>(_dynamicOutputPorts, index, subIndex, std::move(loc)); }
 
-    [[nodiscard]] gr::DynamicPort& dynamicInputPort(PortDefinition definition, std::source_location location = std::source_location::current()) {
-        return std::visit(meta::overloaded(                                                                                                                                                        //
-                              [this, &location](const PortDefinition::IndexBased& _definition) -> DynamicPort& { return dynamicInputPort(_definition.topLevel, _definition.subIndex, location); }, //
-                              [this, &location](const PortDefinition::StringBased& _definition) -> DynamicPort& { return dynamicInputPort(std::string_view(_definition.name), location); }),       //
-            definition.definition);
+    [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicInputPort(PortDefinition definition, std::source_location location = std::source_location::current()) {
+        if (auto* idx = std::get_if<PortDefinition::IndexBased>(&definition.definition)) {
+            return dynamicInputPort(idx->topLevel, idx->subIndex, location);
+        } else {
+            auto& str = std::get<PortDefinition::StringBased>(definition.definition);
+            return dynamicPortFromName(_dynamicInputPorts, std::string_view(str.name), location);
+        }
     }
 
-    [[nodiscard]] gr::DynamicPort& dynamicOutputPort(PortDefinition definition, std::source_location location = std::source_location::current()) {
-        return std::visit(meta::overloaded(                                                                                                                                                         //
-                              [this, &location](const PortDefinition::IndexBased& _definition) -> DynamicPort& { return dynamicOutputPort(_definition.topLevel, _definition.subIndex, location); }, //
-                              [this, &location](const PortDefinition::StringBased& _definition) -> DynamicPort& { return dynamicOutputPort(std::string_view(_definition.name), location); }),       //
-            definition.definition);
+    [[nodiscard]] std::expected<gr::DynamicPort*, Error> dynamicOutputPort(PortDefinition definition, std::source_location location = std::source_location::current()) {
+        if (auto* idx = std::get_if<PortDefinition::IndexBased>(&definition.definition)) {
+            return dynamicOutputPort(idx->topLevel, idx->subIndex, location);
+        } else {
+            auto& str = std::get<PortDefinition::StringBased>(definition.definition);
+            return dynamicPortFromName(_dynamicOutputPorts, std::string_view(str.name), location);
+        }
     }
 
     [[nodiscard]] std::size_t dynamicInputPortsSize(std::size_t parentIndex = meta::invalid_index) const {
@@ -342,7 +391,7 @@ public:
         }
     }
 
-    std::size_t dynamicInputPortIndex(const std::string& name, std::source_location location = std::source_location::current()) const {
+    std::expected<std::size_t, Error> dynamicInputPortIndex(const std::string& name, std::source_location location = std::source_location::current()) const {
         initDynamicPorts();
         for (std::size_t i = 0UZ; i < _dynamicInputPorts.size(); ++i) {
             if (auto* portCollection = std::get_if<NamedPortCollection>(&_dynamicInputPorts.at(i))) {
@@ -350,16 +399,16 @@ public:
                     return i;
                 }
             } else if (auto* port = std::get_if<gr::DynamicPort>(&_dynamicInputPorts.at(i))) {
-                if (port->name == name) {
+                if (port->metaInfo.name == name) {
                     return i;
                 }
             }
         }
 
-        throw gr::exception(std::format("Port {} does not exist", name), location);
+        return std::unexpected(Error(std::format("Port {} does not exist", name), location));
     }
 
-    std::size_t dynamicOutputPortIndex(const std::string& name, std::source_location location = std::source_location::current()) const {
+    std::expected<std::size_t, Error> dynamicOutputPortIndex(const std::string& name, std::source_location location = std::source_location::current()) const {
         initDynamicPorts();
         for (std::size_t i = 0UZ; i < _dynamicOutputPorts.size(); ++i) {
             if (auto* portCollection = std::get_if<NamedPortCollection>(&_dynamicOutputPorts.at(i))) {
@@ -367,13 +416,13 @@ public:
                     return i;
                 }
             } else if (auto* port = std::get_if<gr::DynamicPort>(&_dynamicOutputPorts.at(i))) {
-                if (port->name == name) {
+                if (port->metaInfo.name == name) {
                     return i;
                 }
             }
         }
 
-        throw gr::exception(std::format("Port {} does not exist", name), location);
+        return std::unexpected(Error(std::format("Port {} does not exist", name), location));
     }
 
     virtual ~BlockModel() = default;
@@ -511,7 +560,7 @@ public:
     [[nodiscard]] virtual gr::property_map exportedInputPorts()  = 0;
     [[nodiscard]] virtual gr::property_map exportedOutputPorts() = 0;
 
-    virtual void exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
+    [[nodiscard]] virtual std::expected<void, Error> exportPort(bool exportFlag, std::string_view uniqueBlockName, PortDirection portDirection, std::string_view portName, std::string_view exportedName, std::source_location location = std::source_location::current()) = 0;
 };
 
 namespace serialization_fields {
@@ -577,10 +626,10 @@ property_map serializeEdge(const auto& edge) {
     result.emplace(serialization_fields::EDGE_NAME, std::string(edge.name()));
 
     result.emplace(serialization_fields::EDGE_BUFFER_SIZE, static_cast<gr::Size_t>(edge.bufferSize()));
-    result.emplace(serialization_fields::EDGE_EDGE_STATE, std::string(magic_enum::enum_name(edge.state())));
+    result.emplace(serialization_fields::EDGE_EDGE_STATE, std::string(gr::meta::enumName(edge.state()).value_or("")));
     result.emplace(serialization_fields::EDGE_N_READERS, static_cast<gr::Size_t>(edge.nReaders()));
     result.emplace(serialization_fields::EDGE_N_WRITERS, static_cast<gr::Size_t>(edge.nWriters()));
-    result.emplace(serialization_fields::EDGE_TYPE, std::string(magic_enum::enum_name(edge.edgeType())));
+    result.emplace(serialization_fields::EDGE_TYPE, std::string(gr::meta::enumName(edge.edgeType()).value_or("")));
 
     return result;
 }
@@ -596,155 +645,30 @@ enum Flags : int {
 };
 }
 
-template<typename PluginLoader>
-requires(not std::is_pointer_v<std::remove_cvref_t<PluginLoader>>)
-inline property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<BlockModel>& block, int flags) {
-    using namespace std::string_literals;
-
-    property_map result;
-    result.emplace(serialization_fields::BLOCK_ID, pluginLoader.registry().typeName(block));
-    result.emplace(serialization_fields::BLOCK_UNIQUE_NAME, std::string(block->uniqueName()));
-    result.emplace(serialization_fields::BLOCK_CATEGORY, std::string(magic_enum::enum_name(block->blockCategory())));
-
-    if (!block->metaInformation().empty()) {
-        result.emplace(serialization_fields::BLOCK_META_INFORMATION, block->metaInformation());
-    }
-
-    if (flags & BlockSerializationFlags::Settings) {
-        // Helper function to write parameters
-        auto writeParameters = [&](const property_map& settingsMap) {
-            pmt::Value::Map parameters;
-            auto            writeMap = [&](const auto& localMap) {
-                for (const auto& [settingsKey, settingsValue] : localMap) {
-                    parameters[settingsKey] = settingsValue;
-                }
-            };
-            writeMap(settingsMap);
-            return parameters;
-        };
-
-        // We don't have a use for info which parameters weren't applied here
-        const auto& applyResult = block->settings().applyStagedParameters();
-        const auto& stored      = block->settings().getStoredAll();
-
-        result.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(block->settings().get()));
-
-        using namespace std::string_literals;
-        Tensor<pmt::Value> ctxParamsSeq;
-        ctxParamsSeq.reserve(stored.size());
-        for (const auto& [ctx, ctxParameters] : stored) {
-            if (ctx.holds<std::string>()) {
-                if (auto str = ctx.value_or(std::string_view{}); str.empty()) {
-                    continue;
-                }
-            }
-
-            for (const auto& [ctxTime, settingsMap] : ctxParameters) {
-                pmt::Value::Map ctxParam;
-
-                // Convert ctxTime.context to a string, regardless of its actual type
-                std::string contextStr;
-                pmt::ValueVisitor([&contextStr](const auto& arg) {
-                    using T = std::decay_t<decltype(arg)>;
-                    if constexpr (std::is_same_v<T, std::string>) {
-                        contextStr = arg;
-                    } else if constexpr (std::is_same_v<std::string_view, T> || std::is_same_v<std::pmr::string, T>) {
-                        contextStr = std::string(arg);
-                    } else if constexpr (std::is_arithmetic_v<T>) {
-                        contextStr = std::to_string(arg);
-                    } else {
-                        contextStr.clear();
-                    }
-                }).visit(ctxTime.context);
-
-                ctxParam.emplace(gr::tag::CONTEXT.shortKey(), contextStr);
-                ctxParam.emplace(gr::tag::CONTEXT_TIME.shortKey(), ctxTime.time);
-                ctxParam.emplace(serialization_fields::BLOCK_PARAMETERS, writeParameters(settingsMap));
-                ctxParamsSeq.emplace_back(std::move(ctxParam));
-            }
-        }
-        result.emplace(serialization_fields::BLOCK_CTX_PARAMETERS, std::move(ctxParamsSeq));
-    }
-
-    if (flags & BlockSerializationFlags::Ports) {
-        auto serializePortOrCollection = [](const auto& portOrCollection) {
-            // TODO: Type names can be mangled. We need proper type names...
-            return std::visit(meta::overloaded{//
-                                  [](const gr::DynamicPort& port) {
-                                      return property_map{
-                                          //
-                                          {"name", std::string(port.name)}, //
-                                          {"type", port.typeName()}         //
-                                      };
-                                  },
-                                  [](const BlockModel::NamedPortCollection& namedCollection) {
-                                      return property_map{
-                                          //
-                                          {"name", std::string(namedCollection.name)},                                                               //
-                                          {"size", static_cast<gr::Size_t>(namedCollection.ports.size())},                                           //
-                                          {"type", namedCollection.ports.empty() ? std::string() : std::string(namedCollection.ports[0].typeName())} //
-                                      };
-                                  }},
-                portOrCollection);
-        };
-
-        property_map inputPorts;
-        for (auto& portOrCollection : block->dynamicInputPorts()) {
-            inputPorts[convert_string_domain(BlockModel::portName(portOrCollection))] = serializePortOrCollection(portOrCollection);
-        }
-        result.emplace(serialization_fields::BLOCK_INPUT_PORTS, std::move(inputPorts));
-
-        property_map outputPorts;
-        for (auto& portOrCollection : block->dynamicOutputPorts()) {
-            outputPorts[convert_string_domain(BlockModel::portName(portOrCollection))] = serializePortOrCollection(portOrCollection);
-        }
-        result.emplace(serialization_fields::BLOCK_OUTPUT_PORTS, std::move(outputPorts));
-    }
-
-    if (flags & BlockSerializationFlags::Children) {
-        if (block->blockCategory() != block::Category::NormalBlock) {
-            property_map serializedChildren;
-            for (const auto& child : block->blocks()) {
-                serializedChildren[std::pmr::string(child->uniqueName())] = serializeBlock(pluginLoader, child, flags);
-            }
-            result.emplace(serialization_fields::BLOCK_CHILDREN, std::move(serializedChildren));
-
-            property_map serializedEdges;
-            std::size_t  index = 0UZ;
-            for (const auto& edge : block->edges()) {
-                serializedEdges[convert_string_domain(std::to_string(index))] = serializeEdge(edge);
-                index++;
-            }
-            result.emplace(serialization_fields::BLOCK_EDGES, std::move(serializedEdges));
-        }
-    }
-
-    return result;
-}
+class PluginLoader;
+property_map serializeBlockImpl(PluginLoader& pluginLoader, const std::shared_ptr<BlockModel>& block, int flags);
+property_map serializeBlock(PluginLoader& pluginLoader, const std::shared_ptr<BlockModel>& block, int flags);
 
 namespace detail {
 template<typename T, typename... Ts>
 constexpr bool contains_type = (std::is_same_v<T, Ts> || ...);
 }
 
-template<BlockLike T>
-requires std::is_constructible_v<T, property_map>
+template<BlockLike T, typename Ownership = std::true_type>
 class BlockWrapper : public BlockModel {
+    static constexpr bool kOwning = Ownership::value;
+
 protected:
     static_assert(std::is_same_v<T, std::remove_reference_t<T>>);
-    T           _block;
-    std::string _type_name = gr::meta::type_name<T>();
+    std::conditional_t<kOwning, T, T*> _block;
+    std::string                        _type_name = gr::meta::type_name<T>();
 
     void initMessagePorts() {
-        msgIn  = std::addressof(_block.msgIn);
-        msgOut = std::addressof(_block.msgOut);
+        msgIn  = std::addressof(blockRef().msgIn);
+        msgOut = std::addressof(blockRef().msgOut);
     }
 
     void dynamicPortsLoader() {
-        if (_dynamicPortsLoaded) {
-            return;
-        }
-
         auto processPort = []<typename TPort>(auto& where, TPort& port) -> auto& {
             where.push_back(gr::DynamicPort(port, DynamicPort::non_owned_reference_tag{}));
             return where.back();
@@ -758,12 +682,13 @@ protected:
                     NamedPortCollection result;
                     result.name = CurrentPortType::Name;
                     for (auto& port : collection) {
+                        port.metaInfo.name = CurrentPortType::Name;
                         processPort(result.ports, port);
                     }
                     where.push_back(std::move(result));
                 } else {
-                    auto& port = CurrentPortType::getPortObject(blockRef());
-                    port.name  = CurrentPortType::Name;
+                    auto& port         = CurrentPortType::getPortObject(blockRef());
+                    port.metaInfo.name = CurrentPortType::Name;
                     processPort(where, port);
                 }
             };
@@ -771,8 +696,6 @@ protected:
             traits::block::all_input_ports<TBlock>::for_each(registerPort, _dynamicInputPorts);
             traits::block::all_output_ports<TBlock>::for_each(registerPort, _dynamicOutputPorts);
         }
-
-        _dynamicPortsLoaded = true;
     }
 
     static void blockWrapperDynamicPortsLoader(BlockModel* base) {
@@ -781,13 +704,25 @@ protected:
     }
 
 public:
-    explicit BlockWrapper(gr::property_map initParameter = {}) : _block(std::move(initParameter)) {
+    explicit BlockWrapper(gr::property_map initParameter = {})
+    requires(kOwning && std::is_constructible_v<T, property_map>)
+        : _block(std::move(initParameter)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
     }
 
-    explicit BlockWrapper(T&& original) : _block(std::move(original)) {
+    explicit BlockWrapper(T&& original)
+    requires kOwning
+        : _block(std::move(original)) {
+        initMessagePorts();
+        _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
+        _dynamicPortsLoader.instance = this;
+    }
+
+    explicit BlockWrapper(T& ref)
+    requires(!kOwning)
+        : _block(std::addressof(ref)) {
         initMessagePorts();
         _dynamicPortsLoader.fn       = &BlockWrapper::blockWrapperDynamicPortsLoader;
         _dynamicPortsLoader.instance = this;
@@ -905,10 +840,10 @@ public:
     [[nodiscard]] void*                      raw() override { return std::addressof(blockRef()); }
 
     // Common interface between managed and unmanaged graphs
-    [[nodiscard]] gr::Graph*       graph() override { return nullptr; }
-    [[nodiscard]] gr::property_map exportedInputPorts() override { return {}; }
-    [[nodiscard]] gr::property_map exportedOutputPorts() override { return {}; }
-    void                           exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location = std::source_location::current()) override {}
+    [[nodiscard]] gr::Graph*                 graph() override { return nullptr; }
+    [[nodiscard]] gr::property_map           exportedInputPorts() override { return {}; }
+    [[nodiscard]] gr::property_map           exportedOutputPorts() override { return {}; }
+    [[nodiscard]] std::expected<void, Error> exportPort(bool, std::string_view, PortDirection, std::string_view, std::string_view, std::source_location = std::source_location::current()) override { return {}; }
 };
 
 namespace detail {
@@ -961,7 +896,7 @@ namespace detail {
 } // namespace detail
 
 template<gr::PortDirection direction>
-[[nodiscard]] std::size_t absolutePortIndex(const std::shared_ptr<gr::BlockModel>& block, const gr::PortDefinition& portDefinition, std::source_location loc = std::source_location::current()) {
+[[nodiscard]] std::expected<std::size_t, gr::Error> absolutePortIndex(const std::shared_ptr<gr::BlockModel>& block, const gr::PortDefinition& portDefinition, std::source_location loc = std::source_location::current()) {
     constexpr bool        isInput            = direction == gr::PortDirection::INPUT;
     constexpr static auto portCollectionSize = [](const std::shared_ptr<gr::BlockModel>& b, std::size_t idx = gr::meta::invalid_index) -> std::size_t {
         if constexpr (isInput) {
@@ -970,13 +905,13 @@ template<gr::PortDirection direction>
             return b->dynamicOutputPortsSize(idx);
         }
     };
-    constexpr static auto countPortsPrior = [](const std::shared_ptr<gr::BlockModel>& b, std::size_t idx) -> std::size_t {
+    constexpr static auto countPortsPrior = [](const std::shared_ptr<gr::BlockModel>& b, std::size_t idx) -> std::expected<std::size_t, gr::Error> {
         const std::size_t nTopLevel = portCollectionSize(b);
         if (idx >= nTopLevel) {
-            throw gr::exception(std::format("Block '{}'({}) has no input port at index {} [0, {}]", b->name(), b->uniqueName(), idx, nTopLevel));
+            return std::unexpected(gr::Error(std::format("Block '{}'({}) has no input port at index {} [0, {}]", b->name(), b->uniqueName(), idx, nTopLevel)));
         }
         std::size_t nPortsPrior = 0UZ;
-        for (std::size_t i = 0UZ; i < idx; ++i) { // count all ports in collections before idx
+        for (std::size_t i = 0UZ; i < idx; ++i) {
             std::size_t nPortsInCollection = 0UZ;
             if constexpr (isInput) {
                 nPortsInCollection = b->dynamicInputPortsSize(i);
@@ -984,7 +919,7 @@ template<gr::PortDirection direction>
                 nPortsInCollection = b->dynamicOutputPortsSize(i);
             }
             const bool isNonCollectionPort = nPortsInCollection == gr::meta::invalid_index;
-            nPortsPrior += isNonCollectionPort ? 1UZ : nPortsInCollection; //
+            nPortsPrior += isNonCollectionPort ? 1UZ : nPortsInCollection;
         }
         return nPortsPrior;
     };
@@ -992,25 +927,42 @@ template<gr::PortDirection direction>
     if (const auto* idx = std::get_if<gr::PortDefinition::IndexBased>(&portDefinition.definition)) {
         if (idx->subIndex != gr::meta::invalid_index) {
             if (idx->subIndex >= portCollectionSize(block, idx->topLevel)) {
-                throw gr::exception(std::format("Block '{}'({}) has no input port at index {} [0, {}]", block->name(), block->uniqueName(), idx->subIndex, portCollectionSize(block, idx->topLevel)), loc);
+                return std::unexpected(gr::Error(std::format("Block '{}'({}) has no input port at index {} [0, {}]", block->name(), block->uniqueName(), idx->subIndex, portCollectionSize(block, idx->topLevel)), loc));
             }
-            return countPortsPrior(block, idx->topLevel) + idx->subIndex;
+            auto priorResult = countPortsPrior(block, idx->topLevel);
+            if (!priorResult) {
+                return std::unexpected(priorResult.error());
+            }
+            return priorResult.value() + idx->subIndex;
         }
-        // no subIndex -> first element of the group (scalar or collection)
-        return idx->topLevel == 0UZ ? 0UZ : (countPortsPrior(block, idx->topLevel));
+        if (idx->topLevel == 0UZ) {
+            return 0UZ;
+        }
+        return countPortsPrior(block, idx->topLevel);
     }
 
-    if (const auto idx = std::get_if<gr::PortDefinition::StringBased>(&portDefinition.definition); idx) {                                                                     // portDefinition is StringBased, e.g. "in#1";
-        const auto& port                  = isInput ? block->dynamicInputPort(std::string_view(idx->name), loc) : block->dynamicOutputPort(std::string_view(idx->name), loc); // N.B. can throw if name not present
-        const auto [baseName, portOffset] = detail::portBaseNameAndOffset(port.portName(), portDefinition);
-        const std::size_t baseIdx         = isInput ? block->dynamicInputPortIndex(std::string(baseName), loc) : block->dynamicOutputPortIndex(std::string(baseName), loc);
+    if (const auto idx = std::get_if<gr::PortDefinition::StringBased>(&portDefinition.definition); idx) {
+        auto portResult = isInput ? block->dynamicInputPort(std::string_view(idx->name), loc) : block->dynamicOutputPort(std::string_view(idx->name), loc);
+        if (!portResult) {
+            return std::unexpected(portResult.error());
+        }
+        const auto [baseName, portOffset] = detail::portBaseNameAndOffset(portResult.value()->metaInfo.name, portDefinition);
+        auto baseIdxResult                = isInput ? block->dynamicInputPortIndex(std::string(baseName), loc) : block->dynamicOutputPortIndex(std::string(baseName), loc);
+        if (!baseIdxResult) {
+            return std::unexpected(baseIdxResult.error());
+        }
+        const std::size_t baseIdx = baseIdxResult.value();
         if (baseIdx == gr::meta::invalid_index) {
             return gr::meta::invalid_index;
         }
         if (portOffset >= portCollectionSize(block, baseIdx)) {
-            throw gr::exception(std::format("Block {} port offset {} out of bounds [0, {}]", block->uniqueName(), portOffset, portCollectionSize(block)), loc);
+            return std::unexpected(gr::Error(std::format("Block {} port offset {} out of bounds [0, {}]", block->uniqueName(), portOffset, portCollectionSize(block)), loc));
         }
-        return countPortsPrior(block, baseIdx) + portOffset;
+        auto priorResult = countPortsPrior(block, baseIdx);
+        if (!priorResult) {
+            return std::unexpected(priorResult.error());
+        }
+        return priorResult.value() + portOffset;
     }
 
     return gr::meta::invalid_index;
@@ -1026,16 +978,14 @@ struct std::formatter<gr::PortDefinition> {
 
     template<typename FormatContext>
     auto format(const gr::PortDefinition& port, FormatContext& ctx) const {
-        if (std::holds_alternative<gr::PortDefinition::IndexBased>(port.definition)) {
-            const auto& index = std::get<gr::PortDefinition::IndexBased>(port.definition);
-            if (index.subIndex == gr::meta::invalid_index) {
-                return std::format_to(ctx.out(), "{}", index.topLevel);
+        if (auto* idx = std::get_if<gr::PortDefinition::IndexBased>(&port.definition)) {
+            if (idx->subIndex == gr::meta::invalid_index) {
+                return std::format_to(ctx.out(), "{}", idx->topLevel);
             } else {
-                return std::format_to(ctx.out(), "{}#{}", index.topLevel, index.subIndex);
+                return std::format_to(ctx.out(), "{}#{}", idx->topLevel, idx->subIndex);
             }
         } else {
-            const auto& str = std::get<gr::PortDefinition::StringBased>(port.definition);
-            return std::format_to(ctx.out(), "{}", str.name);
+            return std::format_to(ctx.out(), "{}", std::get<gr::PortDefinition::StringBased>(port.definition).name);
         }
     }
 };
@@ -1060,7 +1010,7 @@ struct std::formatter<gr::Edge> {
 
         return std::format_to(ctx.out(), "{}/{} ⟶ (name: '{}', size: {:2}, weight: {:2}, state: {}) ⟶ {}/{}", //
             getName(e._sourceBlock), e._sourcePortDefinition,                                                 // src
-            e._name, e._minBufferSize, e._weight, magic_enum::enum_name(e._state),                            // edge
+            e._name, e._minBufferSize, e._weight, gr::meta::enumName(e._state).value_or(""),                  // edge
             getName(e._destinationBlock), e._destinationPortDefinition);                                      // dst
     }
 };

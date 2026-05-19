@@ -7,7 +7,7 @@
 
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
 
-[![All Contributors](https://img.shields.io/badge/all_contributors-15-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-17-orange.svg?style=flat-square)](#contributors-)
 
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
@@ -26,6 +26,12 @@ led to adoption in hobbyist, academic, and commercial environments. GNU Radio ha
 found use in software-defined radio, digital communications, nuclear physics, high-
 energy particle physics, astrophysics, radio astronomy and more!
 
+## Binary builds
+
+Our binary builds are generated with `CPACK_PACKAGING_INSTALL_PREFIX=/opt/gnuradio4` in
+order to avoid clashing with distribution provided gnuradio, on client code
+you might need to pass `CMAKE_PREFIX_PATH` in order to find it.
+
 ## Building
 
 GNU Radio 4.0 uses modern C++ (C++23), and is tested for
@@ -33,7 +39,7 @@ GNU Radio 4.0 uses modern C++ (C++23), and is tested for
 - CMake (>= 3.25),
 - GCC (>=13.3, better: >=14.2)
 - Clang (>=18, recommended), and
-- Emscripten (3.1.66).
+- Emscripten (5.0.2).
 
 **To build**:
 
@@ -111,13 +117,12 @@ describe how to set up a local development environment.
 ## License and Copyright
 
 Unless otherwise noted: SPDX-License-Identifier: MIT<br>
-All code contributions to GNU Radio core and runtime will be integrated into a library under the MIT, ensuring it remains free/libre (FLOSS) for both personal and commercial use, without further constraints on either.  GNU Radio also allows for individual block libraries to be licensed as GPLv3.
+All code contributions to GNU Radio core and runtime will be integrated into a library under the MIT, ensuring it remains free/libre (FLOSS) for both personal and commercial use, without further constraints on either. GNU Radio also allows for individual block libraries to be licensed as GPLv3.
 For details on these distinctions and how to contribute, please consult: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 Copyright (C) The GNU Radio Authors<br>
 Copyright (C) Contributors to the GNU Radio Project<br>
 Copyright (C) FAIR - Facility for Antiproton & Ion Research, Darmstadt, Germany<br>
-
 
 ## Acknowledgements
 
@@ -135,23 +140,25 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
   <tbody>
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/wirew0rm"><img src="https://avatars.githubusercontent.com/u/1202371?v=4" width="100px;" alt=""/><br /><sub><b>Alexander Krimm</b></sub></a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/noc0lour"><img src="https://avatars.githubusercontent.com/u/4438327?v=4" width="100px;" alt=""/><br /><sub><b>Andrej Rode</b></sub></a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/gitXsingh"><img src="https://avatars.githubusercontent.com/u/149612072?v=4" width="100px;" alt=""/><br /><sub><b>Anmolmeet Singh</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/cafeclimber"><img src="https://avatars.githubusercontent.com/u/10188900?v=4" width="100px;" alt=""/><br /><sub><b>Bailey Campbell</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/chrisjohgorman"><img src="https://avatars.githubusercontent.com/u/29354995?v=4" width="100px;" alt=""/><br /><sub><b>Chris Gorman</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://destevez.net"><img src="https://avatars.githubusercontent.com/u/15093841?v=4" width="100px;" alt=""/><br /><sub><b>Daniel Estévez</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/dennisklein"><img src="https://avatars.githubusercontent.com/u/297548?v=4" width="100px;" alt=""/><br /><sub><b>Dennis Klein</b></sub></a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/frankosterfeld"><img src="https://avatars.githubusercontent.com/u/483854?v=4" width="100px;" alt=""/><br /><sub><b>Frank Osterfeld</b></sub></a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://cukic.co"><img src="https://avatars.githubusercontent.com/u/90119?v=4" width="100px;" alt=""/><br /><sub><b>Ivan Čukić</b></sub></a></td>
     </tr>
     <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/frankosterfeld"><img src="https://avatars.githubusercontent.com/u/483854?v=4" width="100px;" alt=""/><br /><sub><b>Frank Osterfeld</b></sub></a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://cukic.co"><img src="https://avatars.githubusercontent.com/u/90119?v=4" width="100px;" alt=""/><br /><sub><b>Ivan Čukić</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/marcusmueller"><img src="https://avatars.githubusercontent.com/u/958972?v=4" width="100px;" alt=""/><br /><sub><b>Marcus Müller</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://mattkretz.github.io/"><img src="https://avatars.githubusercontent.com/u/3306474?v=4" width="100px;" alt=""/><br /><sub><b>Matthias Kretz</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/eltos"><img src="https://avatars.githubusercontent.com/u/19860638?v=4" width="100px;" alt=""/><br /><sub><b>Philipp Niedermayer</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/RalphSteinhagen"><img src="https://avatars.githubusercontent.com/u/46007894?v=4" width="100px;" alt=""/><br /><sub><b>Ralph J. Steinhagen</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/iamsergio"><img src="https://avatars.githubusercontent.com/u/20387?v=4" width="100px;" alt=""/><br /><sub><b>Sergio Martins</b></sub></a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/flynn378"><img src="https://avatars.githubusercontent.com/u/6114517?v=4" width="100px;" alt=""/><br /><sub><b>Toby Flynn</b></sub></a></td>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/drslebedev"><img src="https://avatars.githubusercontent.com/u/25366186?v=4" width="100px;" alt=""/><br /><sub><b>drslebedev</b></sub></a></td>
     </tr>
     <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/flynn378"><img src="https://avatars.githubusercontent.com/u/6114517?v=4" width="100px;" alt=""/><br /><sub><b>Toby Flynn</b></sub></a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/drslebedev"><img src="https://avatars.githubusercontent.com/u/25366186?v=4" width="100px;" alt=""/><br /><sub><b>drslebedev</b></sub></a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/mormj"><img src="https://avatars.githubusercontent.com/u/34754695?v=4" width="100px;" alt=""/><br /><sub><b>mormj</b></sub></a></td>
     </tr>
   </tbody>

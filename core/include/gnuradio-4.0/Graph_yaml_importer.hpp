@@ -119,11 +119,14 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                         throw gr::exception(std::format("Required Block {} not found in:\n{}", requiredBlockName, gr::graph::format(graph)), location);
                     }
 
-                    graphWrapper->exportPort(true,                                                     //
-                        blockUniqueName,                                                               //
-                        portDirectionString == "INPUT" ? PortDirection::INPUT : PortDirection::OUTPUT, //
-                        internalPortName,                                                              //
-                        exportedPortName);
+                    if (auto result = graphWrapper->exportPort(true,                                       //
+                            blockUniqueName,                                                               //
+                            portDirectionString == "INPUT" ? PortDirection::INPUT : PortDirection::OUTPUT, //
+                            internalPortName,                                                              //
+                            exportedPortName);
+                        !result.has_value()) {
+                        throw result.error();
+                    }
                 }
             };
 
@@ -251,6 +254,9 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
 
                 return result{block, {static_cast<std::size_t>(*index), static_cast<std::size_t>(*subIndex)}};
 
+            } else if (const auto portFieldString = portField.value_or(std::string_view{}); portFieldString.data()) {
+                return result{block, {std::string(portFieldString)}};
+
             } else {
                 const auto index = checked_access_ptr{portField.template get_if<std::int64_t>()};
                 if (index == nullptr) {
@@ -264,7 +270,9 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
         auto dst = parseBlockPort(connection[2], connection[3]);
 
         if (connection.size() == 4) {
-            resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, undefined_size, graph::defaultWeight, graph::defaultEdgeName, location);
+            if (auto r = resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, EdgeParameters{.minBufferSize = undefined_size, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
+                throw gr::exception(std::format("connection failed: {}", r.error().message));
+            }
         } else {
             std::size_t minBufferSize{};
             pmt::ValueVisitor([&minBufferSize]<typename TValue>(const TValue& value) {
@@ -277,7 +285,9 @@ inline void loadGraphFromMap(PluginLoader& loader, gr::Graph& resultGraph, gr::p
                 }
             }).visit(connection[4]);
 
-            resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, minBufferSize, graph::defaultWeight, graph::defaultEdgeName, location);
+            if (auto r = resultGraph.connect(src.block_it->second, src.port_definition, dst.block_it->second, dst.port_definition, EdgeParameters{.minBufferSize = minBufferSize, .weight = graph::defaultWeight, .name = graph::defaultEdgeName}, location); !r) {
+                throw gr::exception(std::format("connection failed: {}", r.error().message));
+            }
         }
     } // for connections
 }
@@ -289,44 +299,7 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
         const std::size_t  nBlocks = gr::graph::countBlocks<gr::block::Category::NormalBlock>(rootGraph);
         Tensor<pmt::Value> serializedBlocks;
         serializedBlocks.reserve(nBlocks);
-        gr::graph::forEachBlock<gr::block::Category::NormalBlock>(rootGraph, [&](const std::shared_ptr<BlockModel>& block) {
-            property_map map;
-
-            if (gr::Graph* subgraph = block->graph()) {
-                map.emplace("id", "SUBGRAPH");
-                map["unique_name"] = std::string(block->uniqueName());
-                map["name"]        = std::string(block->name());
-
-                property_map graphYaml = detail::saveGraphToMap(loader, *subgraph);
-
-                const std::size_t  nExportedPorts = block->exportedInputPorts().size() + block->exportedOutputPorts().size();
-                Tensor<pmt::Value> exportedPortsData;
-                exportedPortsData.reserve(nExportedPorts);
-                for (const auto& [blockName, portName] : block->exportedInputPorts()) {
-                    exportedPortsData.push_back(Tensor<pmt::Value>(data_from, {gr::pmt::Value(blockName), gr::pmt::Value("INPUT"s), gr::pmt::Value(portName)}));
-                }
-                for (const auto& [blockName, portName] : block->exportedOutputPorts()) {
-                    exportedPortsData.push_back(Tensor<pmt::Value>(data_from, {gr::pmt::Value(blockName), gr::pmt::Value("OUTPUT"s), gr::pmt::Value(portName)}));
-                }
-
-                graphYaml["exported_ports"] = std::move(exportedPortsData);
-                map.emplace("graph"s, std::move(graphYaml));
-
-                // TODO: a unit-test that this is working
-                auto* schedulerModel = dynamic_cast<const SchedulerModel*>(block.get());
-
-                if (schedulerModel != nullptr) {
-                    property_map schedulerMap;
-                    schedulerMap["id"] = loader.schedulerRegistry().typeName(block);
-                    map["scheduler"]   = std::move(schedulerMap);
-                }
-
-            } else {
-                map = serializeBlock(loader, block, BlockSerializationFlags::All & (~BlockSerializationFlags::Ports));
-            }
-
-            serializedBlocks.emplace_back(std::move(map));
-        });
+        gr::graph::forEachBlock<gr::block::Category::NormalBlock>(rootGraph, [&serializedBlocks, &loader](const std::shared_ptr<BlockModel>& block) { serializedBlocks.emplace_back(serializeBlock(loader, block, BlockSerializationFlags::All & (~BlockSerializationFlags::Ports))); });
         result["blocks"] = std::move(serializedBlocks);
     }
 
@@ -334,27 +307,25 @@ inline gr::property_map saveGraphToMap(PluginLoader& loader, const gr::Graph& ro
         const std::size_t  nEdges = gr::graph::countEdges<block::Category::NormalBlock>(rootGraph);
         Tensor<pmt::Value> serializedConnections;
         serializedConnections.reserve(nEdges);
-        graph::forEachEdge<block::Category::NormalBlock>(rootGraph, [&](const Edge& edge) { // NormalBlock -> perhaps can be modelled to 'ALL' for a cleaner sub-graph handling
+        graph::forEachEdge<block::Category::NormalBlock>(rootGraph, [&serializedConnections](const Edge& edge) { // NormalBlock -> perhaps can be modelled to 'ALL' for a cleaner sub-graph handling
             Tensor<pmt::Value> seq;
             seq.reserve(7);
 
-            auto writePortDefinition = [&](const auto& definition) { //
-                std::visit(meta::overloaded(                         //
-                               [&](const PortDefinition::IndexBased& _definition) {
-                                   if (_definition.subIndex != meta::invalid_index) {
-                                       Tensor<pmt::Value> seqPort;
-                                       seqPort.reserve(2);
-                                       seqPort.push_back(std::int64_t(_definition.topLevel));
-                                       seqPort.push_back(std::int64_t(_definition.subIndex));
-                                       seq.push_back(std::move(seqPort));
-                                   } else {
-                                       seq.push_back(std::int64_t(_definition.topLevel));
-                                   }
-                               },                                                    //
-                               [&](const PortDefinition::StringBased& _definition) { //
-                                   seq.push_back(_definition.name);
-                               }),
-                    definition.definition);
+            auto writePortDefinition = [&](const auto& definition) {
+                if (auto* idx = std::get_if<PortDefinition::IndexBased>(&definition.definition)) {
+                    if (idx->subIndex != meta::invalid_index) {
+                        Tensor<pmt::Value> seqPort;
+                        seqPort.reserve(2);
+                        seqPort.push_back(std::int64_t(idx->topLevel));
+                        seqPort.push_back(std::int64_t(idx->subIndex));
+                        seq.push_back(std::move(seqPort));
+                    } else {
+                        seq.push_back(std::int64_t(idx->topLevel));
+                    }
+                } else {
+                    auto& str = std::get<PortDefinition::StringBased>(definition.definition);
+                    seq.push_back(str.name);
+                }
             };
 
             seq.push_back(edge.sourceBlock()->name());
@@ -389,6 +360,22 @@ inline gr::meta::indirect<gr::Graph> loadGrc(PluginLoader& loader, std::string_v
 }
 
 inline std::string saveGrc(PluginLoader& loader, const gr::Graph& rootGraph) { return pmt::yaml::serialize(detail::saveGraphToMap(loader, rootGraph)); }
+
+inline std::expected<std::shared_ptr<gr::BlockModel>, gr::Error> detail::instantiateBlockFromYamlDefinition(PluginLoader& loader, const detail::YamlDefinitionsLoader::Definition& def) noexcept {
+    try {
+        gr::Graph tempGraph;
+        detail::loadGraphFromMap(loader, tempGraph, def.definition);
+        auto blocks = tempGraph.blocks();
+        if (blocks.empty()) {
+            return std::unexpected(gr::Error{"YAML definition produced no blocks"});
+        }
+        return blocks.front();
+    } catch (const gr::exception& e) {
+        return std::unexpected(gr::Error{e});
+    } catch (const std::exception& e) {
+        return std::unexpected(gr::Error{e});
+    }
+}
 
 } // namespace gr
 

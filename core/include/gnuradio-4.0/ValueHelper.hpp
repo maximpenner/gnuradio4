@@ -95,7 +95,7 @@ template<typename From, typename To, ConversionPolicy P>
 inline constexpr bool conversion_allowed_v = is_same_type_v<From, To> || (P >= ConversionPolicy::Widening && is_widening_v<From, To>) || (P >= ConversionPolicy::Narrowing && is_narrowing_v<From, To>) || (P == ConversionPolicy::Unchecked && is_static_castable_v<From, To>);
 
 template<typename F, typename T>
-concept FallbackFactory = std::invocable<F> && std::convertible_to<std::invoke_result_t<F>, T>;
+concept FallbackFactory = std::invocable<F> && std::convertible_to<gr::meta::invoke_result_t<F>, T>;
 
 template<typename F, typename T>
 concept FallbackValue = std::convertible_to<F, T> && !FallbackFactory<F, T>;
@@ -638,7 +638,7 @@ std::expected<std::vector<DstT>, ConversionError> valueToVector(const Value& v) 
 #undef DISPATCH_CASE
 
     case Value::ValueType::Value:
-        if (auto* t = const_cast<Value&>(v).get_if<Tensor<Value>>()) return tensorOfValueToVector<DstT, CP, RP>(*t);
+        if (const auto* t = v.get_if<Tensor<Value>>()) return tensorOfValueToVector<DstT, CP, RP>(*t);
         return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
 
     default: return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
@@ -678,7 +678,7 @@ std::expected<std::array<DstT, N>, ConversionError> valueToArray(const Value& v)
 #undef DISPATCH_CASE
 
     case Value::ValueType::Value:
-        if (auto* t = const_cast<Value&>(v).get_if<Tensor<Value>>()) return tensorOfValueToArray<DstT, N, CP, RP>(*t);
+        if (const auto* t = v.get_if<Tensor<Value>>()) return tensorOfValueToArray<DstT, N, CP, RP>(*t);
         return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
 
     default: return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
@@ -718,7 +718,7 @@ std::expected<DstTensor, ConversionError> valueToTensor(const Value& v, std::pmr
 #undef DISPATCH_CASE
 
     case Value::ValueType::Value:
-        if (auto* t = const_cast<Value&>(v).get_if<Tensor<Value>>()) return tensorOfValueToTensor<DstTensor, CP, RP>(*t, mr);
+        if (const auto* t = v.get_if<Tensor<Value>>()) return tensorOfValueToTensor<DstTensor, CP, RP>(*t, mr);
         return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
 
     default: return std::unexpected(ConversionError{.kind = ConversionError::Kind::TypeMismatch});
@@ -866,7 +866,7 @@ std::expected<void, ConversionError> assignTo(TensorT& dst, const Value& value) 
     using T = typename gr::tensor_traits<TensorT>::value_type;
     if constexpr (!gr::tensor_traits<TensorT>::all_static) {
         if (value.value_type() == detail::valueTypeFor<T>() && value.is_tensor()) {
-            if (auto* srcTensor = const_cast<Value&>(value).get_if<Tensor<T>>()) {
+            if (const auto* srcTensor = value.get_if<Tensor<T>>()) {
                 if constexpr (RP == RankPolicy::Strict && gr::tensor_traits<TensorT>::static_rank) {
                     if (srcTensor->rank() != dst.rank()) {
                         return std::unexpected(ConversionError{.kind = ConversionError::Kind::RankMismatch});
@@ -928,8 +928,6 @@ std::expected<void, ConversionError> assignTo(TensorT& dst, Value&& value) {
     return assignTo<CP, RP>(dst, static_cast<const Value&>(value));
 }
 
-// public API: assignTo unordered_map<string, Value>
-
 template<ConversionPolicy CP = ConversionPolicy::Safe, RankPolicy RP = RankPolicy::Strict>
 std::expected<void, ConversionError> assignTo(std::unordered_map<std::string, Value>& dst, const Value& value) {
     auto result = convertTo<std::unordered_map<std::string, Value>, CP, RP>(value);
@@ -945,8 +943,6 @@ std::expected<void, ConversionError> assignTo(std::unordered_map<std::string, Va
     return assignTo<CP, RP>(dst, static_cast<const Value&>(value));
 }
 
-// public API: assignTo std::map<string, Value>
-
 template<ConversionPolicy CP = ConversionPolicy::Safe, RankPolicy RP = RankPolicy::Strict>
 std::expected<void, ConversionError> assignTo(std::map<std::string, Value>& dst, const Value& value) {
     auto result = convertTo<std::map<std::string, Value>, CP, RP>(value);
@@ -961,8 +957,6 @@ template<ConversionPolicy CP = ConversionPolicy::Safe, RankPolicy RP = RankPolic
 std::expected<void, ConversionError> assignTo(std::map<std::string, Value>& dst, Value&& value) {
     return assignTo<CP, RP>(dst, static_cast<const Value&>(value));
 }
-
-// public API: assignTo typed unordered_map<string, V>
 
 template<ConversionPolicy CP = ConversionPolicy::Safe, RankPolicy RP = RankPolicy::Strict, typename V>
 requires(!std::same_as<V, Value>)
@@ -980,8 +974,6 @@ requires(!std::same_as<V, Value>)
 std::expected<void, ConversionError> assignTo(std::unordered_map<std::string, V>& dst, Value&& value) {
     return assignTo<CP, RP>(dst, static_cast<const Value&>(value));
 }
-
-// public API: assignTo typed std::map<string, V>
 
 template<ConversionPolicy CP = ConversionPolicy::Safe, RankPolicy RP = RankPolicy::Strict, typename V>
 requires(!std::same_as<V, Value>)
@@ -1099,6 +1091,8 @@ private:
     MAKE_HANDLER_MEMBER(const Tensor<std::complex<float>>&, tensor_complex_float);
     MAKE_HANDLER_MEMBER(const Tensor<std::complex<double>>&, tensor_complex_double);
 
+    MAKE_HANDLER_MEMBER(const Tensor<std::pmr::string>&, tensor_pmr_string);
+
     MAKE_HANDLER_MEMBER(const Tensor<Value>&, tensor_value);
 
     MAKE_HANDLER_MEMBER(std::monostate, monostate);
@@ -1141,6 +1135,8 @@ public:
           MAKE_FIELD_INIT(const Tensor<double>&, tensor_double),                       //
           MAKE_FIELD_INIT(const Tensor<std::complex<float>>&, tensor_complex_float),   //
           MAKE_FIELD_INIT(const Tensor<std::complex<double>>&, tensor_complex_double), //
+
+          MAKE_FIELD_INIT(const Tensor<std::pmr::string>&, tensor_pmr_string), //
 
           MAKE_FIELD_INIT(const Tensor<Value>&, tensor_value), //
           MAKE_FIELD_INIT(std::monostate, monostate)           //

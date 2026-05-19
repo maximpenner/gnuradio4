@@ -15,12 +15,12 @@
 
 #include "CollectionTestBlocks.hpp"
 
-#include <GrBasicBlocks.hpp>
-#include <GrTestingBlocks.hpp>
-#include <qa_grc.hpp>
+#include <gnuradio-4.0/GrBasicBlocks.hpp>
+#include <gnuradio-4.0/GrTestingBlocks.hpp>
+#include <gnuradio-4.0/qa_grc.hpp>
 
 #include "TestBlockRegistryContext.hpp"
-#include "gnuradio-4.0/BlockModel.hpp"
+#include <gnuradio-4.0/BlockModel.hpp>
 
 #include <gnuradio-4.0/meta/UnitTestHelper.hpp>
 
@@ -521,10 +521,10 @@ connections:
         auto&     arraySource0 = graph1.emplaceBlock<gr::testing::ArraySource<double>>({{"name", "ArraySource0"}});
         auto&     arraySource1 = graph1.emplaceBlock<gr::testing::ArraySource<double>>({{"name", "ArraySource1"}});
 
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect<"outA", 0>(arraySource0).to<"inB", 1>(arraySink)));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect<"outA", 1>(arraySource1).to<"inB", 0>(arraySink)));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect<"outB", 0>(arraySource0).to<"inA", 0>(arraySink)));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect<"outB", 1>(arraySource1).to<"inA", 1>(arraySink)));
+        expect(graph1.connect(arraySource0, "outA#0"s, arraySink, "inB#1"s).has_value());
+        expect(graph1.connect(arraySource1, "outA#1"s, arraySink, "inB#0"s).has_value());
+        expect(graph1.connect(arraySource0, "outB#0"s, arraySink, "inA#0"s).has_value());
+        expect(graph1.connect(arraySource1, "outB#1"s, arraySink, "inA#1"s).has_value());
 
         expect(graph1.reconnectAllEdges());
 
@@ -548,10 +548,10 @@ connections:
         auto&     vectorSource0 = graph1.emplaceBlock<gr::testing::VectorSource<double>>({{"name", "VectorSource0"}});
         auto&     vectorSource1 = graph1.emplaceBlock<gr::testing::VectorSource<double>>({{"name", "VectorSource1"}});
 
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect(vectorSource0, {0UZ, 0UZ}, vectorSink, {1UZ, 1UZ})));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect(vectorSource0, {1UZ, 0UZ}, vectorSink, {0UZ, 0UZ})));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect(vectorSource1, {0UZ, 1UZ}, vectorSink, {1UZ, 0UZ})));
-        expect(eq(ConnectionResult::SUCCESS, graph1.connect(vectorSource1, {1UZ, 1UZ}, vectorSink, {0UZ, 1UZ})));
+        expect(graph1.connect(vectorSource0, "outA#0"s, vectorSink, "inB#1"s).has_value());
+        expect(graph1.connect(vectorSource0, "outB#0"s, vectorSink, "inA#0"s).has_value());
+        expect(graph1.connect(vectorSource1, "outA#1"s, vectorSink, "inB#0"s).has_value());
+        expect(graph1.connect(vectorSource1, "outB#1"s, vectorSink, "inA#1"s).has_value());
 
         expect(graph1.reconnectAllEdges());
 
@@ -581,13 +581,13 @@ const boost::ut::suite SettingsTests = [] {
             const auto expectedString       = std::string("abc");
             const bool expectedBool         = true;
             const auto expectedComplex      = std::complex<double>(1., 1.);
-            const auto expectedStringVector = Tensor<pmt::Value>{"a", "b", "c"};
-            const auto expectedBoolVector   = Tensor<bool>(gr::data_from, {true, false, true});
-            const auto expectedDoubleVector = Tensor<double>{1., 2., 3.};
-            const auto expectedInt16Vector  = Tensor<std::int16_t>(gr::data_from, {1, 2, 3});
+            const auto expectedStringVector = std::vector<std::string>{"a", "b", "c"};
+            const auto expectedBoolVector   = std::vector<bool>{true, false, true};
+            const auto expectedDoubleVector = std::vector{1., 2., 3.};
+            const auto expectedInt16Vector  = std::vector<std::int16_t>{1, 2, 3};
 
             using cd                         = std::complex<double>;
-            const auto expectedComplexVector = Tensor<std::complex<double>>{cd{1., 1.}, cd{2., 2.}, cd{3., 3.}};
+            const auto expectedComplexVector = std::vector<std::complex<double>>{cd{1., 1.}, cd{2., 2.}, cd{3., 3.}};
 
             std::ignore = graph1.emplaceBlock<gr::testing::ArraySink<double>>({{"bool_setting", bool(expectedBool)}, {"string_setting", expectedString}, {"complex_setting", expectedComplex}, //
                 {"bool_vector", expectedBoolVector}, {"string_vector", expectedStringVector}, {"double_vector", expectedDoubleVector}, {"int16_vector", expectedInt16Vector}, {"complex_vector", expectedComplexVector}});

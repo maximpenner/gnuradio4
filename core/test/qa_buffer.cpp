@@ -177,7 +177,7 @@ const boost::ut::suite DoubleMappedAllocatorTests = [] {
 #endif
 
 template<typename Writer, std::size_t N>
-void writeVaryingChunkSizes(Writer& writer, std::size_t writerID) {
+void writeVaryingChunkSizes(Writer& writer, std::size_t writerID, std::size_t& errors) {
     gr::thread_pool::thread::setThreadName(std::format("writer#{}", writerID));
     std::size_t pos    = 0;
     std::size_t iWrite = 0;
@@ -186,13 +186,12 @@ void writeVaryingChunkSizes(Writer& writer, std::size_t writerID) {
         const auto              chunkSize   = std::min(kChunkSizes[iWrite % kChunkSizes.size()], N - pos);
         gr::WriterSpanLike auto out         = writer.tryReserve(chunkSize);
         if (out.size() != 0) {
-            boost::ut::expect(boost::ut::eq(writer.nRequestedSamplesToPublish(), 0UZ));
+            errors += (writer.nRequestedSamplesToPublish() != 0UZ) ? 1UZ : 0UZ;
             for (std::size_t i = 0UZ; i < out.size(); i++) {
                 out[i] = {{0, static_cast<int>(pos + i)}};
             }
             out.publish(out.size());
-
-            boost::ut::expect(boost::ut::eq(writer.nRequestedSamplesToPublish(), chunkSize));
+            errors += (writer.nRequestedSamplesToPublish() != chunkSize) ? 1UZ : 0UZ;
             pos += chunkSize;
             ++iWrite;
         }
@@ -476,30 +475,35 @@ const boost::ut::suite<"CircularBuffer<T>"> _circ0 = [] {
         gr::BufferReaderLike auto reader2 = buffer.new_reader();
 
         constexpr auto kWrites      = 200000UZ;
-        auto           writerThread = std::thread(&writeVaryingChunkSizes<decltype(writer), kWrites>, std::ref(writer), 0Uz);
+        std::size_t    writerErrors = 0;
+        auto           writerThread = std::thread(&writeVaryingChunkSizes<decltype(writer), kWrites>, std::ref(writer), 0Uz, std::ref(writerErrors));
 
-        auto readerFnc = [](auto reader, std::size_t readerID) {
+        auto readerFnc = [](auto reader, std::size_t readerID, std::size_t& errors) {
             gr::thread_pool::thread::setThreadName(std::format("reader#{}", readerID));
             std::size_t i = 0;
             while (i < kWrites) {
                 auto in = reader.get().get();
                 for (auto j = 0UZ; j < in.size(); j++) {
                     auto vIt = in[j].find(0);
-                    expect(vIt != in[j].end());
+                    errors += (vIt == in[j].end()) ? 1UZ : 0UZ;
                     if (vIt != in[j].end()) {
-                        expect(eq(vIt->second, static_cast<int>(i)));
+                        errors += (vIt->second != static_cast<int>(i)) ? 1UZ : 0UZ;
                     }
                     i++;
                 }
-                expect(in.consume(in.size()));
+                errors += !in.consume(in.size()) ? 1UZ : 0UZ;
             }
         };
 
-        auto reader1Thread = std::thread(readerFnc, std::ref(reader1), 0UZ);
-        auto reader2Thread = std::thread(readerFnc, std::ref(reader2), 1UZ);
+        std::size_t reader1Errors = 0, reader2Errors = 0;
+        auto        reader1Thread = std::thread(readerFnc, std::ref(reader1), 0UZ, std::ref(reader1Errors));
+        auto        reader2Thread = std::thread(readerFnc, std::ref(reader2), 1UZ, std::ref(reader2Errors));
         writerThread.join();
         reader1Thread.join();
         reader2Thread.join();
+        expect(eq(writerErrors, 0UZ)) << "writer errors";
+        expect(eq(reader1Errors, 0UZ)) << "reader1 errors";
+        expect(eq(reader2Errors, 0UZ)) << "reader2 errors";
     };
 
     "MultiProducerStdMapMultipleWriters"_test = [] {
@@ -517,12 +521,13 @@ const boost::ut::suite<"CircularBuffer<T>"> _circ0 = [] {
             writers.push_back(buffer.new_writer());
         }
 
+        std::array<std::size_t, kNWriters> writerErrors{};
         std::array<std::thread, kNWriters> writerThreads;
         for (std::size_t i = 0UZ; i < kNWriters; i++) {
-            writerThreads[i] = std::thread(&writeVaryingChunkSizes<decltype(writers[i]), kWrites>, std::ref(writers[i]), i);
+            writerThreads[i] = std::thread(&writeVaryingChunkSizes<decltype(writers[i]), kWrites>, std::ref(writers[i]), i, std::ref(writerErrors[i]));
         }
 
-        auto readerFnc = [](auto reader) {
+        auto readerFnc = [](auto reader, std::size_t& errors) {
             std::array<int, kNWriters> next;
             std::ranges::fill(next, 0);
             std::size_t read = 0UZ;
@@ -530,32 +535,37 @@ const boost::ut::suite<"CircularBuffer<T>"> _circ0 = [] {
                 auto in = reader.get().get();
                 for (const auto& map : in) {
                     auto vIt = map.find(0);
-                    expect(vIt != map.end()) << "map does not contain zero";
+                    errors += (vIt == map.end()) ? 1UZ : 0UZ;
                     if (vIt == map.end()) {
                         continue;
                     }
                     const auto value = vIt->second;
-                    expect(ge(value, 0)) << "value in map should be greater than zero";
-                    expect(le(value, static_cast<int>(kWrites))) << "value in map should be smaller than number of samples to publish";
+                    errors += (value < 0) ? 1UZ : 0UZ;
+                    errors += (value > static_cast<int>(kWrites)) ? 1UZ : 0UZ;
                     const auto nextIt = std::ranges::find(next, value);
-                    expect(nextIt != next.end()) << "No writer thread waiting for that number";
+                    errors += (nextIt == next.end()) ? 1UZ : 0UZ;
                     if (nextIt == next.end()) {
                         continue;
                     }
                     *nextIt = value + 1;
                 }
                 read += in.size();
-                expect(in.consume(in.size())) << "Failed to consume all";
+                errors += !in.consume(in.size()) ? 1UZ : 0UZ;
             }
         };
 
-        auto reader1Thread = std::thread(readerFnc, std::ref(reader1));
-        auto reader2Thread = std::thread(readerFnc, std::ref(reader2));
+        std::size_t reader1Errors = 0, reader2Errors = 0;
+        auto        reader1Thread = std::thread(readerFnc, std::ref(reader1), std::ref(reader1Errors));
+        auto        reader2Thread = std::thread(readerFnc, std::ref(reader2), std::ref(reader2Errors));
         for (std::size_t i = 0; i < kNWriters; i++) {
             writerThreads[i].join();
         }
         reader1Thread.join();
         reader2Thread.join();
+        const auto totalWriterErrors = std::accumulate(writerErrors.begin(), writerErrors.end(), 0UZ);
+        expect(eq(totalWriterErrors, 0UZ)) << "writer errors";
+        expect(eq(reader1Errors, 0UZ)) << "reader1 errors";
+        expect(eq(reader2Errors, 0UZ)) << "reader2 errors";
     };
 };
 
@@ -604,7 +614,7 @@ const boost::ut::suite StreamTagConcept = [] {
     "StreamTagConcept"_test = [] {
         // implements a proof-of-concept how stream-tags could be dealt with
         using namespace gr;
-        struct alignas(gr::hardware_destructive_interference_size) buffer_tag {
+        struct alignas(gr::kCacheLine) buffer_tag {
             // N.B. type need to be favourably sized e.g. 1 or a power of 2
             // -> otherwise the automatic buffer sizes are getting very large
             int64_t     index;
@@ -775,6 +785,65 @@ const boost::ut::suite HistoryBufferTest = [] {
         expect(equal(std::vector(hb.crbegin(), hb.crend()), std::vector(hb.rbegin(), hb.rend()))) << "const non-const iterator equivalency";
     };
 
+    "HistoryBuffer - push_front then iterate (lazy mirror)"_test = [] {
+        auto equal = [](const auto& range1, const auto& range2) { return std::equal(range1.begin(), range1.end(), range2.begin(), range2.end()); };
+
+        HistoryBuffer<int> hb(5);
+        for (int i = 1; i <= 7; ++i) {
+            hb.push_front(i); // only writes to primary half
+        }
+        // logical: [7,6,5,4,3]
+
+        // get_span triggers mirror sync
+        auto span = hb.get_span(0);
+        expect(eq(span.size(), 5UZ));
+        expect(eq(span[0], 7));
+        expect(eq(span[4], 3));
+
+        // forward iteration via begin/end triggers mirror sync
+        std::vector<int> forward(hb.begin(), hb.end());
+        expect(equal(forward, std::vector{7, 6, 5, 4, 3}));
+
+        // reverse iteration via rbegin/rend triggers mirror sync
+        std::vector<int> reverse(hb.rbegin(), hb.rend());
+        expect(equal(reverse, std::vector{3, 4, 5, 6, 7}));
+
+        // const iterators
+        const auto&      chb = hb;
+        std::vector<int> cforward(chb.begin(), chb.end());
+        expect(equal(cforward, std::vector{7, 6, 5, 4, 3}));
+    };
+
+    "HistoryBuffer - interleaved push_front and push_back"_test = [] {
+        auto equal = [](const auto& range1, const auto& range2) { return std::equal(range1.begin(), range1.end(), range2.begin(), range2.end()); };
+
+        HistoryBuffer<int> hb(5);
+
+        // push_front writes lazily, push_back syncs mirror eagerly
+        hb.push_front(1); // [1]
+        hb.push_front(2); // [2, 1]
+        hb.push_back(10); // triggers syncMirror, appends => [2, 1, 10]
+
+        expect(eq(hb.size(), 3UZ));
+        expect(eq(hb[0], 2));
+        expect(eq(hb[1], 1));
+        expect(eq(hb[2], 10));
+
+        // verify span and iterator access after interleaving
+        expect(equal(hb.get_span(0), std::vector{2, 1, 10}));
+        expect(equal(std::vector(hb.begin(), hb.end()), std::vector{2, 1, 10}));
+
+        // fill to capacity and overflow
+        hb.push_front(3); // [3, 2, 1, 10]
+        hb.push_front(4); // [4, 3, 2, 1, 10]
+        hb.push_back(20); // syncs mirror, discards oldest front => [3, 2, 1, 10, 20]
+
+        expect(eq(hb.size(), 5UZ));
+        expect(eq(hb[0], 3));
+        expect(eq(hb[4], 20));
+        expect(equal(std::vector(hb.begin(), hb.end()), std::vector{3, 2, 1, 10, 20}));
+    };
+
     "HistoryBuffer<T> constexpr sized"_test = [] {
         HistoryBuffer<int, 5UZ> buffer5;
         HistoryBuffer<int, 8UZ> buffer8;
@@ -906,6 +975,54 @@ const boost::ut::suite HistoryBufferTest = [] {
         expect(eq(hb.size(), 3UZ));
         // we keep the "most recent" 3 => new index[0] should be 10 still, if it fits
         expect(eq(hb[0], 10));
+    };
+
+    "HistoryBuffer - resize with dirty mirror"_test = [] {
+        auto equal = [](const auto& range1, const auto& range2) { return std::equal(range1.begin(), range1.end(), range2.begin(), range2.end()); };
+
+        HistoryBuffer<int> hb(5);
+        for (int i = 1; i <= 5; ++i) {
+            hb.push_front(i); // lazy mirror: primary half only
+        }
+        // [5,4,3,2,1] — mirror is dirty
+
+        // resize must sync mirror before copying
+        hb.resize(8);
+        expect(eq(hb.capacity(), 8UZ));
+        expect(eq(hb.size(), 5UZ));
+
+        // verify data survived the resize via iteration (which reads from mirror)
+        expect(equal(std::vector(hb.begin(), hb.end()), std::vector{5, 4, 3, 2, 1}));
+
+        // verify push_front still works after resize
+        hb.push_front(6);
+        expect(eq(hb[0], 6));
+        expect(equal(std::vector(hb.begin(), hb.end()), std::vector{6, 5, 4, 3, 2, 1}));
+    };
+
+    "HistoryBuffer - dynamic non-power-of-two capacity"_test = [] {
+        // bit_ceil(5) = 8, but user-visible capacity must remain 5
+        HistoryBuffer<int> hb(5);
+        expect(eq(hb.capacity(), 5UZ));
+
+        for (int i = 1; i <= 7; ++i) {
+            hb.push_front(i);
+        }
+        expect(eq(hb.size(), 5UZ));
+        expect(eq(hb.capacity(), 5UZ)); // still 5, not 8
+        expect(eq(hb[0], 7));
+        expect(eq(hb[4], 3));
+
+        // same for push_back
+        HistoryBuffer<int> hb2(3);
+        expect(eq(hb2.capacity(), 3UZ));
+        for (int i = 1; i <= 5; ++i) {
+            hb2.push_back(i);
+        }
+        expect(eq(hb2.size(), 3UZ));
+        expect(eq(hb2.capacity(), 3UZ)); // still 3, not 4
+        expect(eq(hb2[0], 3));
+        expect(eq(hb2[2], 5));
     };
 
     "HistoryBuffer - front/back test"_test = [] {
@@ -1301,6 +1418,686 @@ const boost::ut::suite<"SingleProducerStrategy"> _singleProducerStrategy = [] {
             }
             expect(in.consume(in.size()));
         }
+    };
+};
+
+const boost::ut::suite<"CursorCacheStaleness"> _cursorCacheTests = [] {
+    using namespace boost::ut;
+    using gr::CircularBuffer;
+    using gr::ProducerType;
+    using gr::SpanReleasePolicy;
+
+    auto writeAndPublish = [](auto& writer, std::size_t n, int fillValue = 0) {
+        auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(n);
+        if (!span.empty()) {
+            std::iota(span.begin(), span.end(), fillValue);
+            span.publish(n);
+        }
+        return !span.empty();
+    };
+
+    auto consumeAll = [](auto& reader, std::size_t n) {
+        auto in = reader.get(n);
+        bool ok = in.consume(n);
+        return ok;
+    };
+
+    "single reader - burst fill then full drain then refill"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        expect(writeAndPublish(writer, cap, 0)) << "initial reserve must succeed";
+        expect(eq(writer.available(), 0UZ)) << "buffer must be full after burst";
+
+        expect(consumeAll(reader, cap));
+
+        expect(eq(writer.available(), cap)) << "stale cache: writer sees 0 after full drain";
+        expect(writeAndPublish(writer, cap, 1000)) << "stale cache prevented second burst";
+    };
+
+    "single reader - repeated burst/drain cycles"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        for (int cycle = 0; cycle < 200; ++cycle) {
+            expect(writeAndPublish(writer, cap, cycle * static_cast<int>(cap))) << "cycle " << cycle << ": tryReserve failed (stale cache?)";
+            expect(consumeAll(reader, cap));
+        }
+    };
+
+    "two readers at different rates - producer must track slowest"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer     = buf.new_writer();
+        auto   readerFast = buf.new_reader();
+        auto   readerSlow = buf.new_reader();
+
+        const std::size_t cap       = buf.size();
+        const std::size_t batchSize = cap / 4;
+
+        expect(writeAndPublish(writer, batchSize));
+
+        // fast reader consumes everything, slow reader consumes nothing
+        expect(consumeAll(readerFast, batchSize));
+
+        // writer capacity must reflect the slow reader
+        expect(le(writer.available(), cap - batchSize)) << "cache overestimates: ignores slow reader";
+
+        // slow reader catches up
+        expect(consumeAll(readerSlow, batchSize));
+
+        expect(eq(writer.available(), cap)) << "cache stale after slow reader consumed";
+    };
+
+    "reader added mid-stream - cache must not overestimate capacity"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer  = buf.new_writer();
+        auto   reader1 = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        // advance cursors well past zero
+        for (int i = 0; i < 50; ++i) {
+            expect(writeAndPublish(writer, cap, i * static_cast<int>(cap)));
+            expect(consumeAll(reader1, cap));
+        }
+
+        // add second reader — starts at current publish cursor
+        auto reader2 = buf.new_reader();
+        expect(eq(reader2.available(), 0UZ)) << "new reader should see 0 samples";
+
+        expect(writeAndPublish(writer, cap, 0));
+
+        // reader1 consumes all, reader2 does not
+        expect(consumeAll(reader1, cap));
+
+        // buffer must appear full — reader2 blocks the producer
+        expect(eq(writer.available(), 0UZ)) << "cache overestimate: ignored new slow reader";
+
+        // verify data integrity for reader2
+        {
+            auto in = reader2.get(cap);
+            expect(eq(in.size(), cap));
+            for (std::size_t i = 0; i < cap; ++i) {
+                expect(eq(in[i], static_cast<int>(i))) << "data corruption at index " << i;
+            }
+            expect(in.consume(cap));
+        }
+
+        expect(eq(writer.available(), cap)) << "should be fully free after both readers drained";
+    };
+
+    "reader removed mid-stream - producer must recover capacity"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer  = buf.new_writer();
+        auto   reader1 = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        expect(writeAndPublish(writer, cap));
+
+        // reader1 consumes half
+        {
+            auto in = reader1.get(cap / 2);
+            expect(in.consume(cap / 2));
+        }
+
+        {
+            // add reader2 at publish cursor (past all published data), then immediately remove
+            auto reader2 = buf.new_reader();
+            expect(eq(reader2.available(), 0UZ));
+        }
+
+        // capacity should reflect only reader1 (half consumed)
+        expect(eq(writer.available(), cap / 2)) << "stale cache after reader removal";
+
+        // reader1 consumes the rest
+        {
+            auto in = reader1.get(cap / 2);
+            expect(in.consume(cap / 2));
+        }
+
+        expect(eq(writer.available(), cap)) << "full capacity not restored after drain";
+    };
+
+    "tryReserve with ProcessNone does not corrupt cache"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        expect(writeAndPublish(writer, cap / 2));
+
+        // tryReserve with ProcessNone → reserves but publishes 0 on destruction
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(cap / 4);
+            expect(!span.empty());
+        }
+
+        // the "given back" slots must be visible to the writer again
+        expect(eq(writer.available(), cap / 2)) << "capacity lost after ProcessNone drop";
+
+        expect(writeAndPublish(writer, cap / 2)) << "cannot reserve after ProcessNone drop";
+        expect(eq(writer.available(), 0UZ));
+    };
+
+    "interleaved small writes and partial consumes"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap        = buf.size();
+        std::size_t       produced   = 0;
+        std::size_t       consumed   = 0;
+        const std::size_t target     = cap * 100;
+        std::size_t       stallCount = 0;
+
+        while (produced < target) {
+            // try to produce one sample
+            bool wrote = false;
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(1);
+                if (!span.empty()) {
+                    span[0] = static_cast<int>(produced);
+                    span.publish(1);
+                    ++produced;
+                    stallCount = 0;
+                    wrote      = true;
+                } else {
+                    ++stallCount;
+                    if (stallCount > cap + 10) {
+                        expect(false) << "producer stalled for " << stallCount << " iterations (livelock)";
+                        break;
+                    }
+                }
+            } // span destructed — publish committed
+
+            // consume one sample: every 2nd successful write, or always when stalled
+            const bool shouldConsume = !wrote || (produced % 2 == 0);
+            if (shouldConsume && reader.available() > 0) {
+                auto in = reader.get(1);
+                expect(eq(in[0], static_cast<int>(consumed)));
+                expect(in.consume(1));
+                ++consumed;
+            }
+        }
+
+        // final drain
+        while (reader.available() > 0) {
+            auto in = reader.get(reader.available());
+            consumed += in.size();
+            expect(in.consume(in.size()));
+        }
+
+        expect(eq(consumed, produced)) << "data lost or duplicated";
+    };
+};
+
+const boost::ut::suite<"WrapAroundAndEdgeCases"> _wrapAroundTests = [] {
+    using namespace boost::ut;
+    using gr::CircularBuffer;
+    using gr::ProducerType;
+    using gr::SpanReleasePolicy;
+
+    auto writeAndPublish = [](auto& writer, std::size_t n, int fillValue = 0) {
+        auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(n);
+        if (!span.empty()) {
+            std::iota(span.begin(), span.end(), fillValue);
+            span.publish(n);
+        }
+        return !span.empty();
+    };
+
+    auto consumeAll = [](auto& reader, std::size_t n) {
+        auto in = reader.get(n);
+        return in.consume(n);
+    };
+
+    "single producer - 100 full wrap-around cycles with data verification"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap       = buf.size();
+        const std::size_t nCycles   = 100;
+        int               fillValue = 0;
+
+        for (std::size_t cycle = 0; cycle < nCycles; ++cycle) {
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+                expect(!span.empty()) << "write failed at cycle " << cycle;
+                std::iota(span.begin(), span.end(), fillValue);
+                span.publish(cap);
+            }
+
+            {
+                auto in = reader.get(cap);
+                expect(eq(in.size(), cap));
+                for (std::size_t i = 0; i < cap; ++i) {
+                    expect(eq(in[i], fillValue + static_cast<int>(i))) << "data mismatch at cycle " << cycle << " index " << i;
+                }
+                expect(in.consume(cap));
+            }
+
+            fillValue += static_cast<int>(cap);
+        }
+
+        expect(eq(writer.available(), cap)) << "capacity wrong after " << nCycles << " cycles";
+        expect(eq(reader.available(), 0UZ));
+    };
+
+    "multi producer - 100 full wrap-around cycles with data verification"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap       = buf.size();
+        const std::size_t nCycles   = 100;
+        int               fillValue = 0;
+
+        for (std::size_t cycle = 0; cycle < nCycles; ++cycle) {
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+                expect(!span.empty()) << "write failed at cycle " << cycle;
+                std::iota(span.begin(), span.end(), fillValue);
+                span.publish(cap);
+            }
+
+            {
+                auto in = reader.get(cap);
+                expect(eq(in.size(), cap));
+                for (std::size_t i = 0; i < cap; ++i) {
+                    expect(eq(in[i], fillValue + static_cast<int>(i))) << "data mismatch at cycle " << cycle << " index " << i;
+                }
+                expect(in.consume(cap));
+            }
+
+            fillValue += static_cast<int>(cap);
+        }
+
+        expect(eq(writer.available(), cap));
+    };
+
+    "single producer - partial publish rolls back reserve cursor"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        // reserve full buffer, publish only half
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(cap);
+            expect(!span.empty());
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(cap / 2);
+        }
+
+        expect(eq(reader.available(), cap / 2)) << "reader should see only published half";
+        expect(eq(writer.available(), cap / 2)) << "writer should reclaim unpublished half";
+
+        // verify data integrity of published half
+        {
+            auto in = reader.get(cap / 2);
+            for (std::size_t i = 0; i < cap / 2; ++i) {
+                expect(eq(in[i], static_cast<int>(i)));
+            }
+            expect(in.consume(cap / 2));
+        }
+
+        // now reserve and publish full buffer again — proves rollback was clean
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+            expect(!span.empty()) << "reserve failed after partial publish rollback";
+            std::iota(span.begin(), span.end(), 1000);
+            span.publish(cap);
+        }
+
+        {
+            auto in = reader.get(cap);
+            expect(eq(in[0], 1000)) << "data corruption after partial publish + re-reserve";
+            expect(in.consume(cap));
+        }
+    };
+
+    "single producer - publish 0 of N rolls back completely"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap       = buf.size();
+        const std::size_t capBefore = writer.available();
+        const std::size_t posBefore = writer.position();
+
+        // reserve then publish 0 (explicit)
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(cap / 4);
+            expect(!span.empty());
+            span.publish(0);
+        }
+
+        expect(eq(writer.available(), capBefore)) << "capacity not restored after publish(0)";
+        expect(eq(writer.position(), posBefore)) << "publish cursor moved despite publish(0)";
+        expect(eq(reader.available(), 0UZ)) << "reader sees phantom data after publish(0)";
+    };
+
+    "single producer - repeated partial publishes across wrap boundary"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap       = buf.size();
+        const std::size_t chunkSize = cap / 3; // not a divisor of cap → forces wrap
+        int               value     = 0;
+
+        for (int cycle = 0; cycle < 50; ++cycle) {
+            // reserve chunkSize, publish only half
+            const std::size_t toPublish = chunkSize / 2;
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(chunkSize);
+                if (span.empty()) {
+                    // buffer full — drain reader
+                    auto in = reader.get(reader.available());
+                    expect(in.consume(in.size()));
+                    continue;
+                }
+                std::iota(span.begin(), span.end(), value);
+                span.publish(toPublish);
+            }
+
+            value += static_cast<int>(toPublish);
+
+            // consume what's available
+            if (reader.available() >= toPublish) {
+                auto in = reader.get(toPublish);
+                expect(in.consume(toPublish));
+            }
+        }
+
+        // final drain — verify no data corruption by checking monotonicity
+        int lastValue = -1;
+        while (reader.available() > 0) {
+            auto in = reader.get(reader.available());
+            for (std::size_t i = 0; i < in.size(); ++i) {
+                expect(gt(in[i], lastValue)) << "non-monotonic data at value " << in[i];
+                lastValue = in[i];
+            }
+            expect(in.consume(in.size()));
+        }
+    };
+
+    "back-to-back tryReserve failures do not corrupt writer state"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        // fill buffer completely
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+            expect(!span.empty());
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(cap);
+        }
+
+        // multiple failed tryReserves
+        for (int i = 0; i < 100; ++i) {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(1);
+            expect(span.empty()) << "should fail on full buffer, attempt " << i;
+        }
+
+        // drain and verify writer recovers
+        expect(consumeAll(reader, cap));
+        expect(eq(writer.available(), cap)) << "writer state corrupted after repeated tryReserve failures";
+
+        // verify we can still write
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+            expect(!span.empty()) << "write failed after recovery from tryReserve failures";
+            span.publish(cap);
+        }
+        expect(eq(reader.available(), cap));
+    };
+
+    "multi producer back-to-back tryReserve failures"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        Buffer buf(1024);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        // fill buffer
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+            expect(!span.empty());
+            std::iota(span.begin(), span.end(), 0);
+            span.publish(cap);
+        }
+
+        // repeated failures
+        for (int i = 0; i < 100; ++i) {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessNone>(1);
+            expect(span.empty()) << "should fail on full buffer, attempt " << i;
+        }
+
+        // drain and verify recovery
+        expect(consumeAll(reader, cap));
+        expect(eq(writer.available(), cap)) << "multi writer state corrupted after repeated failures";
+
+        {
+            auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(cap);
+            expect(!span.empty());
+            std::iota(span.begin(), span.end(), 42);
+            span.publish(cap);
+        }
+
+        {
+            auto in = reader.get(cap);
+            expect(eq(in[0], 42));
+            expect(in.consume(cap));
+        }
+    };
+
+    "non-power-of-2 buffer - writes crossing wrap boundary"_test = [] {
+        // 384 is not power-of-2 → exercises modulo path in calculateIndex
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer                      buf(384);
+        auto                        writer    = buf.new_writer();
+        auto                        reader    = buf.new_reader();
+        [[maybe_unused]] const auto actualCap = buf.size(); // may be rounded up
+
+        const std::size_t chunkSize = 100; // doesn't divide actualCap evenly
+        int               value     = 0;
+
+        for (int cycle = 0; cycle < 200; ++cycle) {
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(chunkSize);
+                if (span.empty()) {
+                    auto in = reader.get(reader.available());
+                    expect(in.consume(in.size()));
+                    continue;
+                }
+                std::iota(span.begin(), span.end(), value);
+                span.publish(chunkSize);
+                value += static_cast<int>(chunkSize);
+            }
+
+            if (reader.available() >= chunkSize) {
+                auto in = reader.get(chunkSize);
+                expect(in.consume(chunkSize));
+            }
+        }
+
+        // drain and verify monotonicity
+        int lastValue = -1;
+        while (reader.available() > 0) {
+            auto in = reader.get(reader.available());
+            for (std::size_t i = 0; i < in.size(); ++i) {
+                if (in[i] <= lastValue) {
+                    expect(false) << "non-monotonic at value " << in[i] << " (prev " << lastValue << ")";
+                    break;
+                }
+                lastValue = in[i];
+            }
+            expect(in.consume(in.size()));
+        }
+    };
+
+    "non-power-of-2 buffer - multi producer wrap boundary"_test = [] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Multi>;
+        Buffer buf(384);
+        auto   writer = buf.new_writer();
+        auto   reader = buf.new_reader();
+
+        const std::size_t chunkSize = 100;
+        int               value     = 0;
+
+        for (int cycle = 0; cycle < 200; ++cycle) {
+            {
+                auto span = writer.template tryReserve<SpanReleasePolicy::ProcessAll>(chunkSize);
+                if (span.empty()) {
+                    auto in = reader.get(reader.available());
+                    expect(in.consume(in.size()));
+                    continue;
+                }
+                std::iota(span.begin(), span.end(), value);
+                span.publish(chunkSize);
+                value += static_cast<int>(chunkSize);
+            }
+
+            if (reader.available() >= chunkSize) {
+                auto in = reader.get(chunkSize);
+                expect(in.consume(chunkSize));
+            }
+        }
+
+        int lastValue = -1;
+        while (reader.available() > 0) {
+            auto in = reader.get(reader.available());
+            for (std::size_t i = 0; i < in.size(); ++i) {
+                if (in[i] <= lastValue) {
+                    expect(false) << "non-monotonic at value " << in[i];
+                    break;
+                }
+                lastValue = in[i];
+            }
+            expect(in.consume(in.size()));
+        }
+    };
+
+    "single producer - reader added during active streaming does not lose data"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer  = buf.new_writer();
+        auto   reader1 = buf.new_reader();
+
+        const std::size_t cap = buf.size();
+
+        // run 10 cycles with reader1 only
+        for (int i = 0; i < 10; ++i) {
+            expect(writeAndPublish(writer, cap, i * static_cast<int>(cap)));
+            expect(consumeAll(reader1, cap));
+        }
+
+        // add reader2 mid-stream
+        auto reader2 = buf.new_reader();
+
+        // write another batch — both readers should see it
+        expect(writeAndPublish(writer, cap, 9999));
+
+        // reader1 consumes, reader2 does not → writer should be blocked
+        expect(consumeAll(reader1, cap));
+        expect(eq(writer.available(), 0UZ)) << "writer should be blocked by reader2";
+
+        // now reader2 consumes
+        {
+            auto in = reader2.get(cap);
+            expect(eq(in[0], 9999)) << "reader2 sees wrong data";
+            expect(in.consume(cap));
+        }
+
+        expect(eq(writer.available(), cap)) << "writer not unblocked after both readers consumed";
+
+        // continue streaming with 2 readers — 10 more cycles
+        for (int i = 0; i < 10; ++i) {
+            expect(writeAndPublish(writer, cap, i * 100));
+            expect(consumeAll(reader1, cap));
+            expect(consumeAll(reader2, cap));
+        }
+
+        expect(eq(writer.available(), cap));
+    };
+
+    "single producer - three readers at different consume rates"_test = [&] {
+        using Buffer = CircularBuffer<int, std::dynamic_extent, ProducerType::Single>;
+        Buffer buf(1024);
+        auto   writer  = buf.new_writer();
+        auto   reader1 = buf.new_reader();
+        auto   reader2 = buf.new_reader();
+        auto   reader3 = buf.new_reader();
+
+        const std::size_t cap   = buf.size();
+        const std::size_t chunk = cap / 4;
+
+        // write one chunk
+        expect(writeAndPublish(writer, chunk, 0));
+
+        // reader1 consumes all, reader2 consumes half, reader3 consumes nothing
+        expect(consumeAll(reader1, chunk));
+        expect(consumeAll(reader2, chunk / 2));
+
+        // writer available should be limited by reader3 (consumed 0)
+        expect(eq(writer.available(), cap - chunk)) << "writer not blocked by slowest reader";
+
+        // reader3 consumes its chunk
+        expect(consumeAll(reader3, chunk));
+
+        // writer available limited by reader2 (consumed only half)
+        expect(eq(writer.available(), cap - chunk / 2)) << "writer not tracking reader2 correctly";
+
+        // reader2 catches up
+        expect(consumeAll(reader2, chunk / 2));
+        expect(eq(writer.available(), cap)) << "capacity not restored after all readers caught up";
+    };
+};
+
+const boost::ut::suite<"CircularBuffer::Writer::resource"> writerResourceTests = [] {
+    using namespace boost::ut;
+
+    "Writer::resource returns non-null resource"_test = [] {
+        gr::CircularBuffer<float> buffer(1024);
+        auto                      writer = buffer.new_writer();
+        expect(writer.resource() != nullptr);
+    };
+
+    "Writer::resource returns custom resource when provided"_test = [] {
+        std::array<std::byte, 1 << 20>      arena{};
+        std::pmr::monotonic_buffer_resource customResource(arena.data(), arena.size(), std::pmr::null_memory_resource());
+
+        gr::CircularBuffer<float> buffer(1024, std::pmr::polymorphic_allocator<float>(&customResource));
+        auto                      writer = buffer.new_writer();
+        expect(eq(writer.resource(), static_cast<std::pmr::memory_resource*>(&customResource)));
     };
 };
 

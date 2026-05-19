@@ -8,6 +8,8 @@
 #include <format>
 #include <map>
 #include <new>
+
+#include <gnuradio-4.0/meta/CacheLineSize.hpp>
 #include <numeric>
 #include <print>
 #include <ranges>
@@ -19,11 +21,11 @@
 
 #if __has_include(<stdfloat>) && !defined(__ADAPTIVECPP__)
 #include <stdfloat>
-#else
-#include <cstdint>
+#endif
 #include <limits>
 
-// Inject into std only if truly unavailable (nonstandard, but pragmatic for compatibility)
+#if !defined(__STDCPP_FLOAT32_T__) || !defined(__STDCPP_FLOAT64_T__)
+// Inject into std only when C++23 stdfloat typedefs are missing.
 namespace std {
 using float32_t = float;
 using float64_t = double;
@@ -37,6 +39,7 @@ static_assert(std::numeric_limits<float64_t>::is_iec559 && sizeof(float64_t) * 8
 #pragma GCC diagnostic ignored "-Wshadow"
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 #include <vir/simd.h>
+#include <vir/simdize.h>
 #pragma GCC diagnostic pop
 
 #ifndef DISABLE_SIMD
@@ -68,6 +71,17 @@ T cast(U value) { /// gcc/clang warning suppressing cast
 #pragma GCC diagnostic pop
 
 namespace meta {
+
+#if defined(NDEBUG)
+inline constexpr bool kDebugBuild = false;
+#else
+inline constexpr bool kDebugBuild = true;
+#endif
+
+// Shallow alternative to std::invoke_result_t that avoids the libstdc++
+// __invoke_result cascade. No member-function-pointer support — use std::invoke_result_t there.
+template<typename F, typename... Args>
+using invoke_result_t = decltype(std::declval<F>()(std::declval<Args>()...));
 
 struct null_type {};
 
@@ -666,6 +680,15 @@ concept any_simd = stdx::is_simd_v<V> && (std::same_as<T, void> || std::same_as<
 template<typename V, typename T>
 concept t_or_simd = std::same_as<V, T> || any_simd<V, T>;
 
+template<typename T, typename U = void>
+concept constexpr_value = vir::constexpr_value<T, U>;
+
+template<auto V>
+inline constexpr vir::constexpr_wrapper<V> cw{};
+
+template<typename T, int N = 0>
+using simdize = vir::simdize<T, N>;
+
 template<typename T>
 concept complex_like = std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<double>>;
 
@@ -691,9 +714,6 @@ consteval std::size_t indexForName() {
     };
     return helper(std::make_index_sequence<PortList::size>());
 }
-
-// template<template<typename...> typename Type, typename... Items>
-// using find_type = decltype(std::tuple_cat(std::declval<std::conditional_t<is_instantiation_of<Items, Type>, std::tuple<Items>, std::tuple<>>>()...));
 
 template<template<typename> typename Pred, typename... Items>
 struct find_type;
@@ -768,38 +788,44 @@ auto safe_pair_min(Arg&& arg, Args&&... args) {
 }
 
 template<typename Function, typename Tuple, typename... Tuples>
-auto tuple_for_each(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
+void tuple_for_each(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
     static_assert(((std::tuple_size_v<std::remove_cvref_t<Tuple>> == std::tuple_size_v<std::remove_cvref_t<Tuples>>) && ...));
-    return [&]<std::size_t... Idx>(std::index_sequence<Idx...>) { (([&function, &tuple, &tuples...](auto I) { function(std::get<I>(tuple), std::get<I>(tuples)...); }(std::integral_constant<std::size_t, Idx>{}), ...)); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
+    [&]<std::size_t... Idx>(std::index_sequence<Idx...>) {
+        [[maybe_unused]] auto helper = [&]<std::size_t I>() { function(std::get<I>(tuple), std::get<I>(tuples)...); };
+        (helper.template operator()<Idx>(), ...);
+    }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
 }
 
 template<typename Function, typename Tuple, typename... Tuples>
 void tuple_for_each_enumerate(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
     static_assert(((std::tuple_size_v<std::remove_cvref_t<Tuple>> == std::tuple_size_v<std::remove_cvref_t<Tuples>>) && ...));
-    [&]<std::size_t... Idx>(std::index_sequence<Idx...>) { ([&function](auto I, auto&& t0, auto&&... ts) { function(I, std::get<I>(t0), std::get<I>(ts)...); }(std::integral_constant<std::size_t, Idx>{}, tuple, tuples...), ...); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
+    [&]<std::size_t... Idx>(std::index_sequence<Idx...>) {
+        [[maybe_unused]] auto helper = [&]<std::size_t I>() { function(std::integral_constant<std::size_t, I>{}, std::get<I>(tuple), std::get<I>(tuples)...); };
+        (helper.template operator()<Idx>(), ...);
+    }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
 }
 
 template<typename Function, typename Tuple, typename... Tuples>
 auto tuple_transform(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
     static_assert(((std::tuple_size_v<std::remove_cvref_t<Tuple>> == std::tuple_size_v<std::remove_cvref_t<Tuples>>) && ...));
-    return [&]<std::size_t... Idx>(std::index_sequence<Idx...>) { return std::make_tuple([&function, &tuple, &tuples...](auto I) { return function(std::get<I>(tuple), std::get<I>(tuples)...); }(std::integral_constant<std::size_t, Idx>{})...); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
+    return [&]<std::size_t... Idx>(std::index_sequence<Idx...>) {
+        [[maybe_unused]] auto helper = [&]<std::size_t I>() { return function(std::get<I>(tuple), std::get<I>(tuples)...); };
+        return std::make_tuple(helper.template operator()<Idx>()...);
+    }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
 }
 
 template<typename Function, typename Tuple, typename... Tuples>
 auto tuple_transform_enumerated(Function&& function, Tuple&& tuple, Tuples&&... tuples) {
     static_assert(((std::tuple_size_v<std::remove_cvref_t<Tuple>> == std::tuple_size_v<std::remove_cvref_t<Tuples>>) && ...));
-    return [&]<std::size_t... Idx>(std::index_sequence<Idx...>) { return std::make_tuple([&function, &tuple, &tuples...](auto I) { return function(I, std::get<I>(tuple), std::get<I>(tuples)...); }(std::integral_constant<std::size_t, Idx>{})...); }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
+    return [&]<std::size_t... Idx>(std::index_sequence<Idx...>) {
+        [[maybe_unused]] auto helper = [&]<std::size_t I>() { return function(std::integral_constant<std::size_t, I>{}, std::get<I>(tuple), std::get<I>(tuples)...); };
+        return std::make_tuple(helper.template operator()<Idx>()...);
+    }(std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tuple>>>());
 }
 
 static_assert(std::is_same_v<std::vector<int>, type_transform<std::vector, int>>);
 static_assert(std::is_same_v<std::tuple<std::vector<int>, std::vector<float>>, type_transform<std::vector, std::tuple<int, float>>>);
 static_assert(std::is_same_v<void, type_transform<std::vector, void>>);
-
-#ifdef __cpp_lib_hardware_interference_size
-static inline constexpr const std::size_t kCacheLine = std::hardware_destructive_interference_size;
-#else
-static inline constexpr const std::size_t kCacheLine = 64;
-#endif
 
 namespace detail {
 
@@ -860,6 +886,10 @@ template<typename Fn>
 struct on_scope_exit {
     Fn function;
     on_scope_exit(Fn fn) : function(std::move(fn)) {}
+    on_scope_exit(const on_scope_exit&)            = delete;
+    on_scope_exit(on_scope_exit&&)                 = delete;
+    on_scope_exit& operator=(const on_scope_exit&) = delete;
+    on_scope_exit& operator=(on_scope_exit&&)      = delete;
     ~on_scope_exit() { function(); }
 };
 

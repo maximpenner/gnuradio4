@@ -7,18 +7,12 @@
 #include <expected>
 #include <format>
 #include <source_location>
+#include <utility>
 #include <vector>
 
-#if defined(__GNUC__) && !defined(__clang__) && !defined(__EMSCRIPTEN__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wuseless-cast"
-#endif
-#include <magic_enum.hpp>
-
 #include <gnuradio-4.0/meta/UncertainValue.hpp>
-#if defined(__GNUC__) && !defined(__clang__) && !defined(__EMSCRIPTEN__)
-#pragma GCC diagnostic pop
-#endif
+#include <gnuradio-4.0/meta/reflection.hpp>
+#include <gnuradio-4.0/meta/utils.hpp>
 
 namespace gr {
 namespace time {
@@ -203,7 +197,7 @@ std::ostream& operator<<(std::ostream& os, const gr::Range<T>& v) {
 namespace gr {
 
 template<typename R>
-concept FormattableRange = std::ranges::range<R> && !std::same_as<std::remove_cvref_t<R>, std::string> && !std::same_as<std::remove_cvref_t<R>, std::string_view> && !std::is_array_v<std::remove_cvref_t<R>> && std::formattable<std::ranges::range_value_t<R>, char>;
+concept FormattableRange = std::ranges::range<R> && !gr::meta::string_like<std::remove_cvref_t<R>> && !std::is_array_v<std::remove_cvref_t<R>> && std::formattable<std::ranges::range_value_t<R>, char>;
 
 template<typename OutputIt, typename Container>
 constexpr auto format_join(OutputIt out, const Container& container, std::string_view separator = ", ") {
@@ -394,11 +388,10 @@ struct std::formatter<E, char> {
 
     template<typename FormatContext>
     auto format(E e, FormatContext& ctx) const {
-        if (auto name = magic_enum::enum_name(e); !name.empty()) {
-            return _strFormatter.format(name, ctx); // delegate string formatting
-        } else {
-            return std::format_to(ctx.out(), "{}", std::to_underlying(e)); // fallback to underlying type
+        if (auto name = gr::meta::enumName(e); name.has_value()) {
+            return _strFormatter.format(*name, ctx);
         }
+        return std::format_to(ctx.out(), "{}", std::to_underlying(e));
     }
 };
 #endif

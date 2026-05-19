@@ -6,10 +6,17 @@
 #include <gnuradio-4.0/meta/reflection.hpp>
 #include <gnuradio-4.0/meta/utils.hpp>
 
-#include <atomic>
+#include <gnuradio-4.0/AtomicRef.hpp>
+
 #include <expected>
 #include <source_location>
 #include <string>
+
+// including windows.h sets a macro ERROR to 0.  This causes compile errors with
+// LIfeCycle.hpp.  If we undefine it, this builds properly.
+#ifdef _WIN32
+#undef ERROR
+#endif
 
 namespace gr::lifecycle {
 /**
@@ -67,6 +74,27 @@ namespace gr::lifecycle {
 enum class State : char { IDLE, INITIALISED, RUNNING, REQUESTED_PAUSE, PAUSED, REQUESTED_STOP, STOPPED, ERROR };
 using enum State;
 
+} // namespace gr::lifecycle
+
+// Compile-time performance override; phased out with C++26 reflection.
+namespace gr::meta::detail {
+template<>
+struct EnumTraits<gr::lifecycle::State> {
+    static constexpr std::array<std::pair<gr::lifecycle::State, std::string_view>, 8> entries = {{
+        {gr::lifecycle::State::IDLE, "IDLE"},
+        {gr::lifecycle::State::INITIALISED, "INITIALISED"},
+        {gr::lifecycle::State::RUNNING, "RUNNING"},
+        {gr::lifecycle::State::REQUESTED_PAUSE, "REQUESTED_PAUSE"},
+        {gr::lifecycle::State::PAUSED, "PAUSED"},
+        {gr::lifecycle::State::REQUESTED_STOP, "REQUESTED_STOP"},
+        {gr::lifecycle::State::STOPPED, "STOPPED"},
+        {gr::lifecycle::State::ERROR, "ERROR"},
+    }};
+};
+} // namespace gr::meta::detail
+
+namespace gr::lifecycle {
+
 inline constexpr bool isActive(lifecycle::State state) noexcept { return state == RUNNING || state == REQUESTED_PAUSE || state == PAUSED; }
 
 inline constexpr bool isShuttingDown(lifecycle::State state) noexcept { return state == REQUESTED_STOP || state == STOPPED; }
@@ -114,16 +142,15 @@ enum class StorageType { ATOMIC, NON_ATOMIC };
 template<typename TDerived, StorageType storageType = StorageType::ATOMIC>
 class StateMachine {
 protected:
-    using StateStorage = std::conditional_t<storageType == StorageType::ATOMIC, std::atomic<State>, State>;
-    StateStorage _state{lifecycle::State::IDLE};
+    mutable State _state{lifecycle::State::IDLE};
 
     void setAndNotifyState(State newState) {
         if constexpr (requires(TDerived d) { d.stateChanged(newState); }) {
             static_cast<TDerived*>(this)->stateChanged(newState);
         }
         if constexpr (storageType == StorageType::ATOMIC) {
-            _state.store(newState, std::memory_order_release);
-            _state.notify_all();
+            gr::atomic_ref(_state).store_release(newState);
+            gr::atomic_ref(_state).notify_all();
         } else {
             _state = newState;
         }
@@ -159,18 +186,21 @@ protected:
 public:
     StateMachine() noexcept {
         if constexpr (storageType == StorageType::ATOMIC) {
-            _state.store(State::IDLE, std::memory_order_release);
+            gr::atomic_ref(_state).store_release(State::IDLE);
         }
     }
 
     StateMachine(StateMachine&& other) noexcept { *this = std::move(other); }
+    ~StateMachine()                              = default;
+    StateMachine(const StateMachine&)            = delete;
+    StateMachine& operator=(const StateMachine&) = delete;
 
     StateMachine& operator=(StateMachine&& other) noexcept {
         // _other's state is put in STOPPED, so that a moved-from ~Block() becomes a no-op
         if (this != &other) {
             if constexpr (storageType == StorageType::ATOMIC) {
-                _state.store(other._state.load(std::memory_order_acquire), std::memory_order_release);
-                other._state.store(State::STOPPED, std::memory_order_release);
+                gr::atomic_ref(_state).store_release(gr::atomic_ref(other._state).load_acquire());
+                gr::atomic_ref(other._state).store_release(State::STOPPED);
             } else {
                 _state       = other._state;
                 other._state = State::STOPPED;
@@ -182,7 +212,7 @@ public:
     [[nodiscard]] std::expected<void, Error> changeStateTo(State newState, const std::source_location location = std::source_location::current()) {
         State oldState;
         if constexpr (storageType == StorageType::ATOMIC) {
-            oldState = _state.load(std::memory_order_acquire);
+            oldState = gr::atomic_ref(_state).load_acquire();
         } else {
             oldState = _state;
         }
@@ -193,7 +223,7 @@ public:
         if (!isValidTransition(oldState, newState)) {
             return std::unexpected(Error{std::format("Block '{}' invalid state transition in {} from {} -> to {}", //
                                              getBlockName(), gr::meta::type_name<TDerived>(),                      //
-                                             magic_enum::enum_name(state()), magic_enum::enum_name(newState)),
+                                             gr::meta::enumName(state()).value_or(""), gr::meta::enumName(newState).value_or("")),
                 location});
         }
 
@@ -240,7 +270,7 @@ public:
 
     [[nodiscard]] State state() const noexcept {
         if constexpr (storageType == StorageType::ATOMIC) {
-            return _state.load(std::memory_order_acquire);
+            return gr::atomic_ref(_state).load_acquire();
         } else {
             return _state;
         }
@@ -249,7 +279,7 @@ public:
     void waitOnState(State oldState)
     requires(storageType == StorageType::ATOMIC)
     {
-        _state.wait(oldState, std::memory_order_acquire);
+        gr::atomic_ref(_state).wait(oldState);
     }
 };
 

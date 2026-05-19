@@ -1,11 +1,7 @@
-if(ENABLE_TESTS)
-  add_subdirectory(test)
-  add_subdirectory(benchmarks)
-endif()
-
 if(NOT EMSCRIPTEN)
-  set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
   add_library(gnuradio-plugin SHARED plugin.cpp)
+  add_library(gnuradio4::gnuradio-plugin ALIAS gnuradio-plugin)
+  set_target_properties(gnuradio-plugin PROPERTIES BUILD_WITH_INSTALL_RPATH ON)
   target_include_directories(
     gnuradio-plugin PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
                            $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}> $<INSTALL_INTERFACE:include/>)

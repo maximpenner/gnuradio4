@@ -25,12 +25,14 @@ public:
     immutable(Args&&... args) : _value(std::forward<Args>(args)...) {}
 
     // Only construction is allowed
-    immutable(immutable<T>&& other) : _value(std::move(other._value)) { other._value = T{}; }
+    immutable(immutable<T>&& other) noexcept(std::is_nothrow_move_constructible_v<T> && std::is_nothrow_default_constructible_v<T> && std::is_nothrow_move_assignable_v<T>) : _value(std::move(other._value)) { other._value = T{}; }
     immutable(const immutable<T>& other) : _value(other._value) {}
 
     // No assignment, these are const values
     immutable<T>& operator=(const immutable<T>& other) = delete;
     immutable<T>& operator=(immutable<T>&& other)      = delete;
+
+    ~immutable() = default;
 
     const T& value() const { return _value; }
 

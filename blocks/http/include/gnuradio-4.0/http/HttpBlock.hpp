@@ -3,14 +3,19 @@
 
 #include <gnuradio-4.0/Block.hpp>
 #include <gnuradio-4.0/BlockRegistry.hpp>
-#include <gnuradio-4.0/Graph.hpp>
+#include <gnuradio-4.0/algorithm/fileio/FileIo.hpp>
 #include <gnuradio-4.0/meta/reflection.hpp>
 
-#include <queue>
-#include <semaphore>
+#include <format>
+#include <limits>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #ifdef __GNUC__
-#pragma GCC diagnostic push // ignore warning of external libraries that from this lib-context we do not have any control over
+#pragma GCC diagnostic push
 #ifndef __clang__
 #pragma GCC diagnostic ignored "-Wuseless-cast"
 #endif
@@ -22,271 +27,203 @@
 #pragma GCC diagnostic pop
 #endif
 
-#ifdef __EMSCRIPTEN__
-#include <emscripten/emscripten.h>
-#include <emscripten/fetch.h>
-#include <emscripten/threading.h>
-#else
-#include <httplib.h>
-#endif
-
 using namespace gr;
-using namespace std::chrono_literals;
 
 namespace gr::http {
 
-enum class RequestType : char {
+namespace fileio = gr::algorithm::fileio;
+
+enum class SourceMode : char {
     GET       = 1,
     SUBSCRIBE = 2,
-    POST      = 3,
 };
 
-GR_REGISTER_BLOCK(gr::http::HttpBlock, [T], [ float, double ])
-
-template<typename T>
-struct HttpBlock : Block<HttpBlock<T>, BlockingIO<false>> {
+GR_REGISTER_BLOCK(gr::http::HttpSource)
+struct HttpSource : Block<HttpSource> {
     using Description = Doc<R""(
-The HttpBlock allows to use the responses from HTTP APIs (e.g. REST APIs) as the value for this block's output port.
-The block can be used either on-demand to do single requests, or can use long polling to subscribe to an event stream.
-The result is provided on a single output port as a map with the following keys:
-- status: The HTTP status code, usually 200 on success
-- raw-data: The data of the response
-- mime-type: The mime-type of the response
-)"">;
+Read data from an HTTP endpoint.
 
-    using Block<HttpBlock<T>, BlockingIO<false>>::Block; // needed to inherit mandatory base-class Block(property_map) constructor
+GET reads one response.
+SUBSCRIBE keeps polling and publishes each new response.
+
+Each output item is a PMT map with:
+- status: HTTP status code
+- raw-data: response body bytes
+- mime-type: response content type
+
+Internally this uses FileIo.
+)"">;
 
     PortOut<pmt::Value::Map> out;
 
-    std::string           url;
-    std::string           endpoint = "/";
-    gr::http::RequestType type     = gr::http::RequestType::GET;
-    std::string           parameters; // x-www-form-urlencoded encoded POST parameters
+    gr::Annotated<std::string, "URI">                                                       url;
+    gr::Annotated<gr::http::SourceMode, "type", gr::Doc<"GET, SUBSCRIBE">>                  type        = gr::http::SourceMode::GET;
+    gr::Annotated<gr::Size_t, "chunk_bytes", gr::Doc<"Chunk size in bytes, 0 = no limits">> chunk_bytes = 0U;
 
-    GR_MAKE_REFLECTABLE(HttpBlock, out, url, endpoint, type, parameters);
+    GR_MAKE_REFLECTABLE(HttpSource, out, url, type, chunk_bytes);
 
-    // used for queuing GET responses for the consumer
-    std::queue<pmt::Value::Map> _backlog;
-    std::mutex                  _backlog_mutex;
+    fileio::Reader _reader;
+    bool           _emscriptenRunOnMainThread = true; // used in Emscripten unit-tests only
 
-    std::shared_ptr<std::thread> _thread;
-    std::atomic_size_t           _pendingRequests = 0;
-    std::atomic_bool             _shutdownThread  = false;
-    std::binary_semaphore        _ready{0};
+    ~HttpSource() {
+        // cancel before ~Block() runs — derived members are destroyed before the CRTP base destructor
+        _reader.cancel();
+        if (lifecycle::isActive(this->state())) {
+            std::ignore = this->changeStateTo(lifecycle::State::REQUESTED_STOP);
+            std::ignore = this->changeStateTo(lifecycle::State::STOPPED);
+        }
+    }
 
-#ifndef __EMSCRIPTEN__
-    std::unique_ptr<httplib::Client> _client;
-#endif
-
-#ifdef __EMSCRIPTEN__
-    void queueWorkEmscripten(emscripten_fetch_t* fetch) {
+    [[nodiscard]] static pmt::Value::Map makeResultValue(std::span<const std::uint8_t> rawData, int status = 200, std::string_view mimeType = "text/plain") {
         pmt::Value::Map result;
-        result["mime-type"] = "text/plain";
-        result["status"]    = static_cast<int>(fetch->status);
-        result["raw-data"]  = std::string(fetch->data, static_cast<std::size_t>(fetch->numBytes));
-
-        queueWork(result);
-    }
-
-    void onSuccess(emscripten_fetch_t* fetch) {
-        queueWorkEmscripten(fetch);
-        emscripten_fetch_close(fetch);
-    }
-
-    void onError(emscripten_fetch_t* fetch) {
-        // we still want to queue the response, the statusCode will just not be 200
-        queueWorkEmscripten(fetch);
-        emscripten_fetch_close(fetch);
-    }
-
-    void doRequestEmscripten() {
-        emscripten_fetch_attr_t attr;
-        emscripten_fetch_attr_init(&attr);
-        if (type == RequestType::POST) {
-            strcpy(attr.requestMethod, "POST");
-            if (!parameters.empty()) {
-                attr.requestData     = parameters.c_str();
-                attr.requestDataSize = parameters.size();
-            }
-        } else {
-            strcpy(attr.requestMethod, "GET");
-        }
-
-        // this is needed so that we can call into member functions again, when we receive the Fetch callback
-        attr.userData = this;
-
-        attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY;
-        attr.onsuccess  = [](emscripten_fetch_t* fetch) {
-            auto src = static_cast<HttpBlock<T>*>(fetch->userData);
-            src->onSuccess(fetch);
-        };
-        attr.onerror = [](emscripten_fetch_t* fetch) {
-            auto src = static_cast<HttpBlock<T>*>(fetch->userData);
-            src->onError(fetch);
-        };
-        const auto target = url + endpoint;
-        std::ignore       = emscripten_fetch(&attr, target.c_str());
-    }
-
-    void runThreadEmscripten() {
-        if (type == RequestType::SUBSCRIBE) {
-            while (!_shutdownThread) {
-                // long polling, just keep doing requests
-                std::thread thread{&HttpBlock::doRequestEmscripten, this};
-                thread.join();
-            }
-        } else {
-            while (!_shutdownThread) {
-                while (_pendingRequests > 0) {
-                    _pendingRequests--;
-                    std::thread thread{&HttpBlock::doRequestEmscripten, this};
-                    thread.join();
-                }
-                _ready.acquire();
-            }
-        }
-    }
-#else
-    void runThreadNative() {
-        _client = std::make_unique<httplib::Client>(url);
-        _client->set_follow_location(true);
-        if (type == RequestType::SUBSCRIBE) {
-            // it's long polling, be generous with timeouts
-            _client->set_read_timeout(1h);
-            _client->Get(endpoint, [&](const char* data, size_t len) {
-                pmt::Value::Map result;
-                result["mime-type"] = "text/plain";
-                result["status"]    = 200;
-                result["raw-data"]  = std::string(data, len);
-
-                queueWork(result);
-
-                return !_shutdownThread;
-            });
-        } else {
-            while (!_shutdownThread) {
-                while (_pendingRequests > 0) {
-                    _pendingRequests--;
-                    httplib::Result resp;
-                    if (type == RequestType::POST) {
-                        resp = parameters.empty() ? _client->Post(endpoint) : _client->Post(endpoint, parameters, "application/x-www-form-urlencoded");
-                    } else {
-                        resp = _client->Get(endpoint);
-                    }
-                    pmt::Value::Map result;
-                    if (resp) {
-                        result["mime-type"] = "text/plain";
-                        result["status"]    = resp->status;
-                        result["raw-data"]  = resp->body;
-                        queueWork(result);
-                    }
-                }
-
-                _ready.acquire();
-            }
-        }
-    }
-#endif
-
-    void queueWork(const pmt::Value::Map& item) {
-        {
-            std::lock_guard lg{_backlog_mutex};
-            _backlog.push(item);
-        }
-        const auto work = this->invokeWork();
-        if (work == work::Status::DONE) {
-            this->requestStop();
-        }
-        this->ioLastWorkStatus.exchange(work, std::memory_order_relaxed);
-    }
-
-    void startThread() {
-        if (_thread) {
-            _thread.reset();
-        }
-        _thread = std::shared_ptr<std::thread>(new std::thread([this]() {
-            gr::thread_pool::thread::setThreadName(std::format("uT:{}", gr::meta::shorten_type_name(this->unique_name)));
-#ifdef __EMSCRIPTEN__
-            runThreadEmscripten();
-#else
-                                                   runThreadNative();
-#endif
-        }),
-            [this](std::thread* t) {
-                if (auto ret = this->changeStateTo(gr::lifecycle::State::REQUESTED_STOP); !ret) {
-                    throw std::invalid_argument(std::format("{}::startThread() could not change state to REQUESTED_STOP", this->name));
-                }
-                _shutdownThread = true;
-                _ready.release();
-#ifndef __EMSCRIPTEN__
-                if (_client) {
-                    _client->stop();
-                }
-#endif
-                if (t->joinable()) {
-                    t->join();
-                }
-                _shutdownThread = false;
-                delete t;
-                if (auto ret = this->changeStateTo(gr::lifecycle::State::STOPPED); !ret) {
-                    throw std::invalid_argument(std::format("{}::startThread() could not change state to STOPPED", this->name));
-                }
-            });
-    }
-
-    void stopThread() { _thread.reset(); }
-
-    ~HttpBlock() { stopThread(); }
-
-    void settingsChanged(const property_map& /*oldSettings*/, property_map& newSettings) {
-        if (newSettings.contains("url") || newSettings.contains("type")) {
-            // other setting changes are hot-swappable without restarting the Client
-            if (_thread) {
-                stopThread();
-                startThread();
-            }
-        }
-    }
-
-    void start() { startThread(); }
-
-    void stop() { stopThread(); }
-
-    [[nodiscard]] constexpr auto processOne() noexcept {
-        pmt::Value::Map result;
-        std::lock_guard lg{_backlog_mutex};
-        if (!_backlog.empty()) {
-            result = _backlog.front();
-            _backlog.pop();
-        }
+        result["mime-type"] = std::string(mimeType);
+        result["status"]    = status;
+        result["raw-data"]  = gr::Tensor<std::uint8_t>(rawData.begin(), rawData.end());
         return result;
     }
 
-    void trigger() {
-        _pendingRequests++;
-        _ready.release();
+    [[nodiscard]] fileio::ReaderConfig readerConfig() const {
+        fileio::ReaderConfig config;
+        if (chunk_bytes.value != 0U) {
+            config.chunkBytes = static_cast<std::size_t>(chunk_bytes.value);
+        }
+        config.longPolling               = type.value == SourceMode::SUBSCRIBE;
+        config.emscriptenRunOnMainThread = _emscriptenRunOnMainThread;
+        return config;
     }
 
-    void processMessages(gr::MsgPortInBuiltin& port, std::span<const gr::Message> message) {
-        gr::Block<HttpBlock<T>, BlockingIO<false>>::processMessages(port, message);
+    void openReader() {
+        auto readerExp = fileio::readAsync(url.value, readerConfig());
+        if (!readerExp.has_value()) {
+            throw gr::exception(readerExp.error().message, readerExp.error().sourceLocation);
+        }
+        _reader = std::move(readerExp.value());
+    }
 
-        std::ranges::for_each(message, [this](auto& m) {
-            if (type == RequestType::SUBSCRIBE) {
-                if (m.data.has_value() && m.data.value().contains("active")) {
-                    // for long polling, the subscription should stay active, if and only if the messages' "active" member is true
-                    if (m.data.value().at("active").value_or(false)) {
-                        if (!_thread) {
-                            startThread();
-                        }
-                    } else {
-                        stopThread();
+    void start() { openReader(); }
+
+    void stop() { _reader.cancel(); }
+
+    void settingsChanged(const property_map& /*oldSettings*/, const property_map& newSettings) {
+        if (lifecycle::isActive(this->state()) && (newSettings.contains("url") || newSettings.contains("type") || newSettings.contains("chunk_bytes"))) {
+            _reader.cancel();
+            openReader();
+        }
+    }
+
+    [[nodiscard]] work::Status processBulk(OutputSpanLike auto& outSpan) {
+        if (outSpan.empty()) {
+            return work::Status::INSUFFICIENT_OUTPUT_ITEMS;
+        }
+
+        bool                           finished = false;
+        std::optional<pmt::Value::Map> result;
+        std::optional<gr::Error>       error;
+        std::size_t                    nSamplesToPublish = 0U;
+
+        _reader.poll(
+            [&](const auto& res) {
+                finished = res.isFinal;
+
+                if (res.data.has_value()) {
+                    const auto bytes = res.data.value();
+                    if (!bytes.empty()) {
+                        result            = makeResultValue(bytes);
+                        nSamplesToPublish = 1U;
                     }
+                    return;
                 }
-            } else {
-                // for all other modes, an incoming message means to trigger a new request
-                trigger();
+                error = res.data.error();
+            },
+            std::numeric_limits<std::size_t>::max(), false);
+
+        if (error.has_value()) {
+            throw gr::exception(error->message, error->sourceLocation);
+        }
+        if (result.has_value()) {
+            outSpan[0] = std::move(*result);
+        }
+        outSpan.publish(nSamplesToPublish);
+        if (finished) {
+            return work::Status::DONE;
+        }
+        return work::Status::OK;
+    }
+};
+
+GR_REGISTER_BLOCK(gr::http::HttpSink)
+struct HttpSink : Block<HttpSink> {
+    using Description = Doc<R""(
+Send incoming bytes to an HTTP endpoint with POST.
+
+Each input chunk is sent as one POST request.
+Use content_type to set the Content-Type header.
+
+Internally this uses FileIo.
+)"">;
+
+    PortIn<std::uint8_t> in;
+
+    gr::Annotated<std::string, "URI">                                               url;
+    gr::Annotated<std::string, "content_type", gr::Doc<"HTTP Content-Type header">> content_type = "application/octet-stream";
+
+    GR_MAKE_REFLECTABLE(HttpSink, in, url, content_type);
+
+    std::optional<fileio::Writer> _writer;
+    bool                          _emscriptenRunOnMainThread = true; // used in Emscripten unit-tests only
+
+    ~HttpSink() {
+        if (_writer.has_value()) {
+            _writer->cancel();
+        }
+        if (lifecycle::isActive(this->state())) {
+            std::ignore = this->changeStateTo(lifecycle::State::REQUESTED_STOP);
+            std::ignore = this->changeStateTo(lifecycle::State::STOPPED);
+        }
+    }
+
+    [[nodiscard]] fileio::WriterConfig writerConfig() const {
+        fileio::WriterConfig config;
+        if (!content_type.value.empty()) {
+            config.httpHeaders.emplace("Content-Type", content_type.value);
+        }
+        config.emscriptenRunOnMainThread = _emscriptenRunOnMainThread;
+        return config;
+    }
+
+    void start() { _writer.reset(); }
+
+    void stop() {
+        if (_writer.has_value()) {
+            _writer->cancel();
+        }
+    }
+
+    [[nodiscard]] work::Status processBulk(InputSpanLike auto& inSpan) {
+        if (inSpan.empty()) {
+            return work::Status::INSUFFICIENT_INPUT_ITEMS;
+        }
+
+        if (_writer.has_value()) {
+            if (!_writer->finished()) {
+                return work::Status::OK;
             }
-        });
+
+            auto writeResultExp = _writer->result();
+            _writer.reset();
+            if (!writeResultExp.has_value()) {
+                throw gr::exception(writeResultExp.error().message, writeResultExp.error().sourceLocation);
+            }
+        }
+
+        auto bytes     = std::span<const std::uint8_t>(inSpan.data(), inSpan.size());
+        auto writerExp = fileio::writeAsync(url.value, bytes, writerConfig());
+        if (!writerExp.has_value()) {
+            throw gr::exception(writerExp.error().message, writerExp.error().sourceLocation);
+        }
+        _writer = std::move(writerExp.value());
+
+        return work::Status::OK;
     }
 };
 

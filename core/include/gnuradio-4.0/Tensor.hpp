@@ -1051,6 +1051,7 @@ struct Tensor<T, Ex...> : TensorBase<T, true, Ex...> { // fully or partially dyn
     using base_t::strides;
 
     Tensor(Tensor&& other) noexcept = default;
+    ~Tensor()                       = default;
     explicit Tensor(const T& v, std::pmr::memory_resource* mr = std::pmr::get_default_resource()) {
         base_t::_data = make_container(mr);
         base_t::fill(v);
@@ -1078,7 +1079,7 @@ struct Tensor<T, Ex...> : TensorBase<T, true, Ex...> { // fully or partially dyn
 
         // move data
         base_t::_data.reserve(other._data.size());
-        for (auto&& elem : other._data) {
+        for (auto& elem : other._data) {
             base_t::_data.push_back(static_cast<T>(std::move(elem)));
         }
     }
